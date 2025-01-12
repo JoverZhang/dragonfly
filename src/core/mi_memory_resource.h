@@ -6,16 +6,11 @@
 
 #include <mimalloc.h>
 
-#ifdef __clang__
-#include <experimental/memory_resource>
-namespace PMR_NS = std::experimental::pmr;
-#else
-#include <memory_resource>
-namespace PMR_NS = std::pmr;
-#endif
+#include "base/pmr/memory_resource.h"
 
 namespace dfly {
 
+// Per thread memory resource that uses mimalloc.
 class MiMemoryResource : public PMR_NS::memory_resource {
  public:
   explicit MiMemoryResource(mi_heap_t* heap) : heap_(heap) {

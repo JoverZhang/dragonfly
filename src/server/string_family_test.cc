@@ -46,9 +46,13 @@ TEST_F(StringFamilyTest, SetGet) {
   EXPECT_EQ(Run({"get", "key1"}), "1");
   EXPECT_EQ(Run({"set", "key", "2"}), "OK");
   EXPECT_EQ(Run({"get", "key"}), "2");
+  EXPECT_THAT(Run({"get", "key3"}), ArgType(RespExpr::NIL));
 
   auto metrics = GetMetrics();
-  EXPECT_EQ(6, metrics.ooo_tx_transaction_cnt);
+  EXPECT_EQ(7, metrics.coordinator_stats.tx_normal_cnt);
+  EXPECT_EQ(3, metrics.events.hits);
+  EXPECT_EQ(1, metrics.events.misses);
+  EXPECT_EQ(3, metrics.events.mutations);
 }
 
 TEST_F(StringFamilyTest, Incr) {
@@ -66,6 +70,10 @@ TEST_F(StringFamilyTest, Incr) {
 
   ASSERT_THAT(Run({"incrby", "ne", "0"}), IntArg(0));
   ASSERT_THAT(Run({"decrby", "a", "-9223372036854775808"}), ErrArg("overflow"));
+  auto metrics = GetMetrics();
+  EXPECT_EQ(10, metrics.events.mutations);
+  EXPECT_EQ(0, metrics.events.misses);
+  EXPECT_EQ(0, metrics.events.hits);
 }
 
 TEST_F(StringFamilyTest, Append) {
@@ -167,6 +175,10 @@ TEST_F(StringFamilyTest, SetOptionsSyntaxError) {
 
   EXPECT_THAT(Run({"set", "key", "val", "NX", "XX"}), ErrArg("ERR syntax error"));
   EXPECT_THAT(Run({"set", "key", "val", "XX", "NX"}), ErrArg("ERR syntax error"));
+
+  EXPECT_THAT(Run({"set", "key", "val", "PX", "9223372036854775800"}),
+              ErrArg("invalid expire time"));
+  EXPECT_THAT(Run({"SET", "foo", "bar", "EX", "18446744073709561"}), ErrArg("invalid expire time"));
 }
 
 TEST_F(StringFamilyTest, Set) {
@@ -189,6 +201,9 @@ TEST_F(StringFamilyTest, Set) {
 
   resp = Run({"set", "foo", "bar", "ex", "1"});
   ASSERT_THAT(resp, "OK");
+
+  ASSERT_THAT(Run({"sadd", "s1", "1"}), IntArg(1));
+  ASSERT_THAT(Run({"set", "s1", "2"}), "OK");
 }
 
 TEST_F(StringFamilyTest, SetHugeKey) {
@@ -196,6 +211,16 @@ TEST_F(StringFamilyTest, SetHugeKey) {
   auto resp = Run({"set", key, "1"});
   ASSERT_THAT(resp, "OK");
   Run({"del", key});
+}
+
+TEST_F(StringFamilyTest, MSetLong) {
+  vector<string> command({"mset"});
+  for (unsigned i = 0; i < 12000; ++i) {
+    command.push_back(StrCat("key", i));
+    command.push_back(StrCat("val", i));
+  }
+  auto resp = Run(absl::MakeSpan(command));
+  EXPECT_EQ(resp, "OK");
 }
 
 TEST_F(StringFamilyTest, MGetSet) {
@@ -226,6 +251,88 @@ TEST_F(StringFamilyTest, MGetSet) {
 
   mget_fb.Join();
   set_fb.Join();
+}
+
+TEST_F(StringFamilyTest, MGetCachingModeBug2276) {
+  absl::FlagSaver fs;
+  SetTestFlag("cache_mode", "true");
+  ResetService();
+  Run({"debug", "populate", "18000", "key", "32", "RAND"});
+
+  // Scan starts traversing the database, because we populated the database with lots of items we
+  // assume that scan will return items from the same bucket that reside next to each other.
+  auto resp = Run({"scan", "0"});
+  ASSERT_THAT(resp, ArrLen(2));
+  StringVec vec = StrArray(resp.GetVec()[1]);
+  ASSERT_GE(vec.size(), 10);
+
+  auto get_bump_ups = [](const string& str) -> size_t {
+    const string matcher = "bump_ups:";
+    const auto pos = str.find(matcher) + matcher.size();
+    const auto next_new_line =
+        str.find("\r\n", pos);  // Find the position of the next "\r\n" after the initial position
+    const auto sub = str.substr(pos, next_new_line - pos);
+    return atoi(sub.c_str());
+  };
+
+  resp = Run({"info", "stats"});
+  EXPECT_EQ(get_bump_ups(resp.GetString()), 0);
+
+  auto mget_resp = StrArray(Run(
+      {"mget", vec[0], vec[1], vec[2], vec[3], vec[4], vec[5], vec[6], vec[7], vec[8], vec[9]}));
+
+  resp = Run({"info", "stats"});
+  size_t bumps1 = get_bump_ups(resp.GetString());
+  EXPECT_GT(bumps1, 0);
+  EXPECT_LT(bumps1, 10);  // we assume that some bumps are blocked because items reside next to each
+                          // other in the slot.
+
+  for (int i = 0; i < 10; ++i) {
+    auto get_resp = Run({"get", vec[i]});
+    EXPECT_EQ(get_resp, mget_resp[i]);
+  }
+
+  resp = Run({"info", "stats"});
+  size_t bumps2 = get_bump_ups(resp.GetString());
+  EXPECT_GT(bumps2, bumps1);
+}
+
+TEST_F(StringFamilyTest, MGetCachingModeBug2465) {
+  absl::FlagSaver fs;
+  SetTestFlag("cache_mode", "true");
+  ResetService();
+  Run({"debug", "populate", "18000", "key", "32", "RAND"});
+
+  // Scan starts traversing the database, because we populated the database with lots of items we
+  // assume that scan will return items from the same bucket that reside next to each other.
+  auto resp = Run({"scan", "0"});
+  ASSERT_THAT(resp, ArrLen(2));
+  StringVec vec = StrArray(resp.GetVec()[1]);
+  ASSERT_GE(vec.size(), 10);
+
+  auto get_bump_ups = [](const string& str) -> size_t {
+    const string matcher = "bump_ups:";
+    const auto pos = str.find(matcher) + matcher.size();
+    const auto next_new_line =
+        str.find("\r\n", pos);  // Find the position of the next "\r\n" after the initial position
+    const auto sub = str.substr(pos, next_new_line - pos);
+    return atoi(sub.c_str());
+  };
+
+  resp = Run({"info", "stats"});
+  EXPECT_EQ(get_bump_ups(resp.GetString()), 0);
+
+  Run({"del", vec[1]});
+  Run({"lpush", vec[1], "a"});
+
+  resp = Run({"get", vec[2]});
+  string val = resp.GetString();
+  auto mget_resp = StrArray(Run({"mget", vec[2], vec[2], vec[2]}));
+  EXPECT_THAT(mget_resp, ElementsAre(val, val, val));
+
+  resp = Run({"info", "stats"});
+  size_t bumps = get_bump_ups(resp.GetString());
+  EXPECT_EQ(bumps, 3);  // one bump for del and one for get and one for mget
 }
 
 TEST_F(StringFamilyTest, MSetGet) {
@@ -363,7 +470,9 @@ TEST_F(StringFamilyTest, SetEx) {
   ASSERT_THAT(Run({"ttl", "key"}), IntArg(10));
   ASSERT_THAT(Run({"setex", "key", "0", "val"}), ErrArg("invalid expire time"));
   ASSERT_EQ(Run({"setex", "key", StrCat(5 * 365 * 24 * 3600), "val"}), "OK");
-  ASSERT_THAT(Run({"setex", "key", StrCat(1 << 30), "val"}), ErrArg("invalid expire time"));
+  ASSERT_THAT(Run({"setex", "key", StrCat(1 << 30), "val"}), "OK");
+  ASSERT_THAT(Run({"ttl", "key"}), IntArg(kMaxExpireDeadlineSec));
+  ASSERT_THAT(Run({"SETEX", "foo", "18446744073709561", "bar"}), ErrArg("invalid expire time"));
 }
 
 TEST_F(StringFamilyTest, Range) {
@@ -390,6 +499,19 @@ TEST_F(StringFamilyTest, Range) {
   Run({"SET", "num", "1234"});
   EXPECT_EQ(Run({"getrange", "num", "3", "5000"}), "4");
   EXPECT_EQ(Run({"getrange", "num", "-5000", "10000"}), "1234");
+
+  Run({"SET", "key4", "1"});
+  EXPECT_EQ(Run({"getrange", "key4", "-1", "-2"}), "");
+  EXPECT_EQ(Run({"getrange", "key4", "0", "-2"}), "1");
+
+  EXPECT_EQ(CheckedInt({"SETRANGE", "key5", "1", ""}), 0);
+  EXPECT_EQ(Run({"GET", "key5"}).type, facade::RespExpr::NIL);
+
+  EXPECT_EQ(CheckedInt({"SETRANGE", "num", "6", ""}), 4);
+  EXPECT_EQ(Run({"GET", "num"}), "1234");
+
+  // we support only 256MB string so this test is failed now
+  // EXPECT_THAT(CheckedInt({"SETRANGE", "", "268435456", "0"}), 268435457);
 }
 
 TEST_F(StringFamilyTest, IncrByFloat) {
@@ -484,6 +606,9 @@ TEST_F(StringFamilyTest, GetEx) {
   EXPECT_THAT(resp, "OK");
 
   resp = Run({"getex", "foo", "EX"});
+  EXPECT_THAT(resp, ErrArg("syntax error"));
+
+  resp = Run({"getex", "foo", "EX", "1", "px", "1"});
   EXPECT_THAT(resp, ErrArg("syntax error"));
 
   resp = Run({"getex", "foo", "bar", "EX"});
@@ -689,6 +814,103 @@ TEST_F(StringFamilyTest, SetWithGetParam) {
   EXPECT_THAT(Run({"set", "key3", "not used", "xx", "get"}), ArgType(RespExpr::NIL));
   EXPECT_THAT(Run({"set", "key2", "val3", "xx", "get"}), "val2");
   EXPECT_EQ(Run({"get", "key2"}), "val3");
+
+  EXPECT_THAT(Run({"sadd", "key4", "1"}), IntArg(1));
+  EXPECT_THAT(Run({"set", "key4", "2", "get"}), ErrArg("wrong kind of value"));
+  EXPECT_THAT(Run({"set", "key4", "2", "xx", "get"}), ErrArg("wrong kind of value"));
+}
+
+TEST_F(StringFamilyTest, SetWithHashtagsNoCluster) {
+  SetTestFlag("cluster_mode", "");
+  SetTestFlag("lock_on_hashtags", "false");
+  ResetService();
+
+  auto fb = ExpectUsedKeys({"{key}1"});
+  EXPECT_EQ(Run({"set", "{key}1", "val1"}), "OK");
+  fb.Join();
+  EXPECT_FALSE(IsLocked(0, "{key}1"));
+
+  fb = ExpectUsedKeys({"{key}2"});
+  EXPECT_EQ(Run({"set", "{key}2", "val2"}), "OK");
+  fb.Join();
+
+  fb = ExpectUsedKeys({"{key}1", "{key}2"});
+  EXPECT_THAT(Run({"mget", "{key}1", "{key}2"}), RespArray(ElementsAre("val1", "val2")));
+  fb.Join();
+  EXPECT_NE(1, GetDebugInfo().shards_count);
+}
+
+TEST_F(StringFamilyTest, SetWithHashtagsWithEmulatedCluster) {
+  SetTestFlag("cluster_mode", "emulated");
+  SetTestFlag("lock_on_hashtags", "false");
+  ResetService();
+
+  auto fb = ExpectUsedKeys({"{key}1"});
+  EXPECT_EQ(Run({"set", "{key}1", "val1"}), "OK");
+  fb.Join();
+
+  fb = ExpectUsedKeys({"{key}2"});
+  EXPECT_EQ(Run({"set", "{key}2", "val2"}), "OK");
+  fb.Join();
+
+  fb = ExpectUsedKeys({"{key}1", "{key}2"});
+  EXPECT_THAT(Run({"mget", "{key}1", "{key}2"}), RespArray(ElementsAre("val1", "val2")));
+  fb.Join();
+  EXPECT_EQ(1, GetDebugInfo().shards_count);
+}
+
+TEST_F(StringFamilyTest, SetWithHashtagsWithHashtagLock) {
+  SetTestFlag("cluster_mode", "emulated");
+  SetTestFlag("lock_on_hashtags", "true");
+  ResetService();
+
+  auto fb = ExpectUsedKeys({"key"});
+  EXPECT_EQ(Run({"set", "{key}1", "val1"}), "OK");
+  fb.Join();
+
+  fb = ExpectUsedKeys({"key"});
+  EXPECT_EQ(Run({"set", "{key}2", "val2"}), "OK");
+  fb.Join();
+
+  fb = ExpectUsedKeys({"key"});
+  EXPECT_THAT(Run({"mget", "{key}1", "{key}2"}), RespArray(ElementsAre("val1", "val2")));
+  fb.Join();
+  EXPECT_EQ(1, GetDebugInfo().shards_count);
+}
+
+TEST_F(StringFamilyTest, MultiSetWithHashtagsDontLockHashtags) {
+  SetTestFlag("cluster_mode", "");
+  SetTestFlag("lock_on_hashtags", "false");
+  ResetService();
+
+  auto fb = ExpectUsedKeys({"{key}1", "{key}2", "{key}3"});
+
+  EXPECT_EQ(Run({"multi"}), "OK");
+  EXPECT_EQ(Run({"set", "{key}1", "val1"}), "QUEUED");
+  EXPECT_EQ(Run({"set", "{key}2", "val2"}), "QUEUED");
+  EXPECT_EQ(Run({"eval", "return redis.call('set', KEYS[1], 'val3')", "1", "{key}3"}), "QUEUED");
+  EXPECT_THAT(Run({"exec"}), RespArray(ElementsAre("OK", "OK", "OK")));
+  fb.Join();
+}
+
+TEST_F(StringFamilyTest, MultiSetWithHashtagsLockHashtags) {
+  SetTestFlag("cluster_mode", "emulated");
+  SetTestFlag("lock_on_hashtags", "true");
+  ResetService();
+
+  auto fb = ExpectUsedKeys({"key"});
+
+  EXPECT_EQ(Run({"multi"}), "OK");
+  EXPECT_EQ(Run({"set", "{key}1", "val1"}), "QUEUED");
+  EXPECT_EQ(Run({"set", "{key}2", "val2"}), "QUEUED");
+  EXPECT_EQ(Run({"eval", "return redis.call('set', KEYS[1], 'val3')", "1", "{key}3"}), "QUEUED");
+  EXPECT_THAT(Run({"exec"}), RespArray(ElementsAre("OK", "OK", "OK")));
+  fb.Join();
+}
+
+TEST_F(StringFamilyTest, EmptyKeys) {
+  EXPECT_EQ(0, CheckedInt({"strlen", "foo"}));
+  EXPECT_EQ(Run({"SUBSTR", "foo", "0", "-1"}), "");
 }
 
 }  // namespace dfly

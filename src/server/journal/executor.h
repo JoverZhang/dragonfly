@@ -7,6 +7,7 @@
 #include <absl/types/span.h>
 
 #include "facade/reply_capture.h"
+#include "server/cluster/cluster_defs.h"
 #include "server/journal/types.h"
 
 namespace dfly {
@@ -16,7 +17,7 @@ class Service;
 // JournalExecutor allows executing journal entries.
 class JournalExecutor {
  public:
-  JournalExecutor(Service* service);
+  explicit JournalExecutor(Service* service);
   ~JournalExecutor();
 
   JournalExecutor(JournalExecutor&&) = delete;
@@ -25,6 +26,11 @@ class JournalExecutor {
   void Execute(DbIndex dbid, journal::ParsedEntry::CmdData& cmd);
 
   void FlushAll();  // Execute FLUSHALL.
+  void FlushSlots(const cluster::SlotRange& slot_range);
+
+  ConnectionContext* connection_context() {
+    return &conn_context_;
+  }
 
  private:
   void Execute(journal::ParsedEntry::CmdData& cmd);

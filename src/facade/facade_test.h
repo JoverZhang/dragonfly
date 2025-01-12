@@ -6,6 +6,10 @@
 
 #include <gmock/gmock.h>
 
+#include <ostream>
+#include <string>
+#include <string_view>
+
 #include "facade/resp_expr.h"
 
 namespace facade {
@@ -22,7 +26,7 @@ class RespMatcher {
   }
   using is_gtest_matcher = void;
 
-  bool MatchAndExplain(const RespExpr& e, testing::MatchResultListener*) const;
+  bool MatchAndExplain(RespExpr e, testing::MatchResultListener*) const;
 
   void DescribeTo(std::ostream* os) const;
 
@@ -74,13 +78,21 @@ inline ::testing::PolymorphicMatcher<RespTypeMatcher> ArgType(RespExpr::Type t) 
 }
 
 MATCHER_P(RespArray, value, "") {
-  return ExplainMatchResult(testing::AllOf(testing::Field(&RespExpr::type, RespExpr::ARRAY),
-                                           testing::Property(&RespExpr::GetVec, value)),
-                            arg, result_listener);
+  return ExplainMatchResult(
+      testing::AllOf(ArgType(RespExpr::ARRAY), testing::Property(&RespExpr::GetVec, value)), arg,
+      result_listener);
+}
+
+template <typename... Args> auto RespElementsAre(const Args&... matchers) {
+  return RespArray(::testing::ElementsAre(matchers...));
 }
 
 inline bool operator==(const RespExpr& left, std::string_view s) {
   return left.type == RespExpr::STRING && ToSV(left.GetBuf()) == s;
+}
+
+inline bool operator==(const RespExpr& left, int64_t val) {
+  return left.type == RespExpr::INT64 && left.GetInt() == val;
 }
 
 inline bool operator!=(const RespExpr& left, std::string_view s) {

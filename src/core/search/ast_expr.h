@@ -8,7 +8,6 @@
 #include <iostream>
 #include <memory>
 #include <ostream>
-#include <regex>
 #include <variant>
 #include <vector>
 
@@ -25,17 +24,22 @@ struct AstStarNode {};
 
 // Matches terms in text fields
 struct AstTermNode {
-  AstTermNode(std::string term);
+  explicit AstTermNode(std::string term);
 
   std::string term;
-  std::regex pattern;
+};
+
+struct AstPrefixNode {
+  explicit AstPrefixNode(std::string prefix);
+
+  std::string prefix;
 };
 
 // Matches numeric range
 struct AstRangeNode {
-  AstRangeNode(int64_t lo, int64_t hi);
+  AstRangeNode(double lo, bool lo_excl, double hi, bool hi_excl);
 
-  int64_t lo, hi;
+  double lo, hi;
 };
 
 // Negates subtree
@@ -66,28 +70,64 @@ struct AstFieldNode {
 
 // Stores a list of tags for a tag query
 struct AstTagsNode {
-  AstTagsNode(std::string tag);
-  AstTagsNode(AstNode&& l, std::string tag);
+  using TagValue = std::variant<AstTermNode, AstPrefixNode>;
 
-  std::vector<std::string> tags;
+  struct TagValueProxy
+      : public AstTagsNode::TagValue {  // bison needs it to be default constructible
+    TagValueProxy() : AstTagsNode::TagValue(AstTermNode("")) {
+    }
+    TagValueProxy(AstPrefixNode tv) : AstTagsNode::TagValue(std::move(tv)) {
+    }
+    TagValueProxy(AstTermNode tv) : AstTagsNode::TagValue(std::move(tv)) {
+    }
+  };
+
+  AstTagsNode(TagValue);
+  AstTagsNode(AstNode&& l, TagValue);
+
+  std::vector<TagValue> tags;
 };
 
 // Applies nearest neighbor search to the final result set
 struct AstKnnNode {
-  AstKnnNode(AstNode&& sub, size_t limit, std::string field, FtVector vec);
+  AstKnnNode() = default;
+  AstKnnNode(uint32_t limit, std::string_view field, OwnedFtVector vec,
+             std::string_view score_alias, std::optional<size_t> ef_runtime);
+
+  AstKnnNode(AstNode&& sub, AstKnnNode&& self);
+
+  friend std::ostream& operator<<(std::ostream& stream, const AstKnnNode& matrix) {
+    return stream;
+  }
 
   std::unique_ptr<AstNode> filter;
   size_t limit;
   std::string field;
-  FtVector vector;
+  OwnedFtVector vec;
+  std::string score_alias;
+  std::optional<float> ef_runtime;
+};
+
+struct AstSortNode {
+  std::unique_ptr<AstNode> filter;
+  std::string field;
+  bool descending = false;
 };
 
 using NodeVariants =
-    std::variant<std::monostate, AstStarNode, AstTermNode, AstRangeNode, AstNegateNode,
-                 AstLogicalNode, AstFieldNode, AstTagsNode, AstKnnNode>;
+    std::variant<std::monostate, AstStarNode, AstTermNode, AstPrefixNode, AstRangeNode,
+                 AstNegateNode, AstLogicalNode, AstFieldNode, AstTagsNode, AstKnnNode, AstSortNode>;
 
 struct AstNode : public NodeVariants {
   using variant::variant;
+
+  friend std::ostream& operator<<(std::ostream& stream, const AstNode& matrix) {
+    return stream;
+  }
+
+  const NodeVariants& Variant() const& {
+    return *this;
+  }
 };
 
 using AstExpr = AstNode;
@@ -96,10 +136,6 @@ using AstExpr = AstNode;
 }  // namespace dfly
 
 namespace std {
-
-inline std::ostream& operator<<(std::ostream& os, const dfly::search::AstExpr& ast) {
-  // os << "ast{" << ast->Debug() << "}";
-  return os;
-}
-
+ostream& operator<<(ostream& os, optional<size_t> o);
+ostream& operator<<(ostream& os, dfly::search::AstTagsNode::TagValueProxy o);
 }  // namespace std

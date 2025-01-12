@@ -32,8 +32,10 @@ class ListFamilyTest : public BaseFamilyTest {
 
   static unsigned NumWatched() {
     atomic_uint32_t sum{0};
+
+    auto ns = &namespaces->GetDefaultNamespace();
     shard_set->RunBriefInParallel([&](EngineShard* es) {
-      auto* bc = es->blocking_controller();
+      auto* bc = ns->GetBlockingController(es->shard_id());
       if (bc)
         sum.fetch_add(bc->NumWatched(0), memory_order_relaxed);
     });
@@ -43,8 +45,9 @@ class ListFamilyTest : public BaseFamilyTest {
 
   static bool HasAwakened() {
     atomic_uint32_t sum{0};
+    auto ns = &namespaces->GetDefaultNamespace();
     shard_set->RunBriefInParallel([&](EngineShard* es) {
-      auto* bc = es->blocking_controller();
+      auto* bc = ns->GetBlockingController(es->shard_id());
       if (bc)
         sum.fetch_add(bc->HasAwakedTransaction(), memory_order_relaxed);
     });
@@ -97,7 +100,8 @@ TEST_F(ListFamilyTest, BLPopUnblocking) {
   ASSERT_THAT(resp, ArrLen(2));
   EXPECT_THAT(resp.GetVec(), ElementsAre(kKey2, "2"));
 
-  Run({"set", "z", "1"});
+  resp = Run({"set", "z", "1"});
+  ASSERT_EQ(resp, "OK");
 
   resp = Run({"blpop", "z", "0"});
   ASSERT_THAT(resp, ErrArg("WRONGTYPE "));
@@ -168,7 +172,7 @@ TEST_F(ListFamilyTest, BLPopTimeout) {
   RespExpr resp = Run({"blpop", kKey1, kKey2, kKey3, "0.01"});
   EXPECT_THAT(resp, ArgType(RespExpr::NIL_ARRAY));
   EXPECT_EQ(3, GetDebugInfo().shards_count);
-  ASSERT_FALSE(service_->IsLocked(0, kKey1));
+  ASSERT_FALSE(IsLocked(0, kKey1));
 
   // Under Multi
   resp = Run({"multi"});
@@ -178,7 +182,7 @@ TEST_F(ListFamilyTest, BLPopTimeout) {
   resp = Run({"exec"});
 
   EXPECT_THAT(resp, ArgType(RespExpr::NIL_ARRAY));
-  ASSERT_FALSE(service_->IsLocked(0, kKey1));
+  ASSERT_FALSE(IsLocked(0, kKey1));
   ASSERT_EQ(0, NumWatched());
 }
 
@@ -362,6 +366,31 @@ TEST_F(ListFamilyTest, LRem) {
   resp = Run({"lrange", kKey1, "0", "1"});
   ASSERT_THAT(resp, ArrLen(2));
   ASSERT_THAT(resp.GetVec(), ElementsAre("b", "c"));
+
+  Run({"set", "foo", "bar"});
+  ASSERT_THAT(Run({"lrem", "foo", "0", "elem"}), ErrArg("WRONGTYPE"));
+  ASSERT_THAT(Run({"lrem", "nexists", "0", "elem"}), IntArg(0));
+
+  // Triggers QUICKLIST_NODE_CONTAINER_PLAIN coverage
+  string val(10000, 'a');
+  Run({"rpush", kKey2, val, "12345678"});
+
+  ASSERT_THAT(Run({"lrem", kKey2, "1", "12345678"}), IntArg(1));
+  ASSERT_THAT(Run({"lrem", kKey2, "1", val}), IntArg(1));
+
+  ASSERT_THAT(Run({"lpush", kKey3, "bar", "bar", "foo"}), IntArg(3));
+  ASSERT_THAT(Run({"lrem", kKey3, "-2", "bar"}), IntArg(2));
+  resp = Run({"lrange", kKey3, "0", "-1"});
+  ASSERT_EQ(resp, "foo");
+}
+
+TEST_F(ListFamilyTest, DumpRestorePlain) {
+  const string kValue(10'000, '#');
+  EXPECT_EQ(CheckedInt({"LPUSH", kKey1, kValue}), 1);
+  auto buffer = Run({"DUMP", kKey1}).GetBuf();
+  EXPECT_EQ(Run({"RESTORE", kKey2, "0", ToSV(buffer)}), "OK");
+  EXPECT_EQ(CheckedInt({"LLEN", kKey2}), 1);
+  EXPECT_EQ(Run({"LRANGE", kKey2, "0", "1"}), kValue);
 }
 
 TEST_F(ListFamilyTest, LTrim) {
@@ -372,6 +401,9 @@ TEST_F(ListFamilyTest, LTrim) {
   ASSERT_THAT(resp.GetVec(), ElementsAre("c", "d"));
   ASSERT_EQ(Run({"ltrim", kKey1, "0", "0"}), "OK");
   ASSERT_EQ(Run({"lrange", kKey1, "0", "1"}), "c");
+  Run({"set", "foo", "bar"});
+  ASSERT_THAT(Run({"ltrim", "foo", "0", "1"}), ErrArg("WRONGTYPE"));
+  ASSERT_EQ(Run({"ltrim", "nexists", "0", "1"}), "OK");
 }
 
 TEST_F(ListFamilyTest, LRange) {
@@ -392,6 +424,14 @@ TEST_F(ListFamilyTest, Lset) {
   ASSERT_EQ(Run({"rpop", kKey1}), "foo");
   Run({"rpush", kKey2, "a"});
   ASSERT_THAT(Run({"lset", kKey2, "1", "foo"}), ErrArg("index out of range"));
+}
+
+TEST_F(ListFamilyTest, LPop) {
+  Run({"rpush", "foo", "bar"});
+  auto resp = Run({"lpop", "foo", "0"});
+  EXPECT_THAT(resp, RespArray(ElementsAre()));
+  resp = Run({"lpop", "bar", "0"});
+  EXPECT_THAT(resp, ArgType(RespExpr::NIL));
 }
 
 TEST_F(ListFamilyTest, LPos) {
@@ -498,6 +538,7 @@ TEST_F(ListFamilyTest, LMove) {
 
   resp = Run({"lmove", kKey1, kKey2, "LEFT", "RIGHT"});
   ASSERT_THAT(resp, "1");
+  ASSERT_THAT(Run({"llen", kKey1}), IntArg(4));
 
   resp = Run({"lmove", kKey1, kKey2, "LEFT", "LEFT"});
   ASSERT_THAT(resp, "2");
@@ -642,6 +683,23 @@ TEST_F(ListFamilyTest, BRPopLPushSingleShard) {
   ASSERT_EQ(0, NumWatched());
 }
 
+TEST_F(ListFamilyTest, BRPopLPushSingleShardBug2857) {
+  Run({"lpush", "src", "val1"});
+  RespExpr resp;
+  auto blpop = [&]() { resp = Run("id", {"blpop", "dest", "4"}); };
+  auto f = pp_->at(1)->LaunchFiber(Launch::dispatch, blpop);
+  EXPECT_THAT(Run({"brpoplpush", "src", "dest", "1"}), "val1");
+  f.Join();
+  EXPECT_THAT(resp, ArgType(RespExpr::ARRAY));
+  EXPECT_THAT(resp.GetVec(), ElementsAre("dest", "val1"));
+
+  // Timeout
+  f = pp_->at(1)->LaunchFiber(Launch::dispatch, blpop);
+  EXPECT_THAT(Run({"brpoplpush", "src", "dest", "1"}), ArgType(RespExpr::NIL));
+  f.Join();
+  EXPECT_THAT(resp, ArgType(RespExpr::NIL_ARRAY));
+}
+
 TEST_F(ListFamilyTest, BRPopLPushSingleShardBlocking) {
   RespExpr resp;
 
@@ -744,6 +802,142 @@ TEST_F(ListFamilyTest, BLMove) {
   ASSERT_THAT(resp.GetVec(), ElementsAre("val1", "val2"));
 }
 
+// Wake two BLMOVEs on the same shard simultaneously
+TEST_F(ListFamilyTest, BLMoveSimultaneously) {
+  EXPECT_EQ(Shard("src1", shard_set->size()),
+            Shard("src10", shard_set->size()));  // wake on same shard
+  EXPECT_NE(Shard("dest110", shard_set->size()),
+            Shard("src1", shard_set->size()));  // Trigger MoveTwoShards
+
+  auto f1 = pp_->at(1)->LaunchFiber([this]() {
+    Run("c1", {"blmove", "src1", "dest110", "LEFT", "RIGHT", "0"});
+  });
+  auto f2 = pp_->at(1)->LaunchFiber([this]() {
+    Run("c2", {"blmove", "src10", "dest110", "LEFT", "RIGHT", "0"});
+  });
+
+  ThisFiber::SleepFor(5ms);
+  Run({"multi"});
+  Run({"rpush", "src1", "v1"});
+  Run({"rpush", "src10", "v2"});
+  Run({"exec"});
+
+  f1.Join();
+  f2.Join();
+
+  auto res = Run({"lrange", "dest110", "0", "-1"});
+  EXPECT_THAT(res.GetVec(), UnorderedElementsAre("v1", "v2"));
+}
+
+// Move key five times in rings 0 -> 1 -> 2 ... -> 0
+TEST_F(ListFamilyTest, BLMoveRings) {
+  vector<fb2::Fiber> fibers;
+#pragma GCC diagnostic push
+// We compile this code both with C++17 and C++20 and if you capture
+// by [=, this] it becomes an error on C++17 and if you capture
+// by [=] it becomes and error in C++20
+#pragma GCC diagnostic ignored "-Wdeprecated"
+  for (int j = 0; j < 5; j++) {
+    for (int i = 0; i < 10; i++) {
+      fibers.emplace_back(pp_->at(i % pp_->size())->LaunchFiber([=]() {
+        auto key1 = to_string(i);
+        auto key2 = to_string((i + 1) % 10);
+        Run(key1 + to_string(j), {"blmove", key1, key2, "LEFT", "RIGHT", "0"});
+      }));
+    }
+  }
+
+  ThisFiber::SleepFor(5ms);
+
+  Run({"lpush", "0", "v1"});
+  for (auto& fiber : fibers)
+    fiber.Join();
+
+  for (int i = 1; i < 10; i++)
+    EXPECT_THAT(Run({"llen", to_string(i)}), IntArg(0));
+  EXPECT_EQ(Run({"lrange", "0", "0", "-1"}), "v1");
+}
+
+// Move in waves where each wave layer has a fixed set of "vertices" through which all values travel
+TEST_F(ListFamilyTest, BLMoveWaves) {
+  const int kFlow = 64;
+  vector<int> wave_sizes = {1 /* 0:0 */, kFlow, kFlow / 2, kFlow / 4, kFlow / 8, kFlow / 3,
+                            kFlow / 5,   1,     kFlow / 6, kFlow,     kFlow / 4, 1};
+
+  vector<fb2::Fiber> fibers;
+  for (size_t i = 1; i < wave_sizes.size(); i++) {
+    for (size_t j = 0; j < kFlow; j++) {
+      auto src = to_string(i - 1) + ":" + to_string(j / (kFlow / wave_sizes[i - 1]));
+      auto dest = to_string(i) + ":" + to_string(j / (kFlow / wave_sizes[i]));
+      fibers.emplace_back(pp_->at(i % 3)->LaunchFiber([=]() {
+        Run("c" + to_string(i * kFlow + j), {"blmove", src, dest, "LEFT", "RIGHT", "0"});
+      }));
+    }
+  }
+
+  vector<string> values(kFlow);
+  for (size_t i = 0; i < kFlow; i++)
+    values[i] = "v" + to_string(i);
+
+  Run({"multi"});
+  for (size_t i = 0; i < kFlow; i++)
+    Run({"lpush", "0:0", values[i]});
+  Run({"exec"});
+
+  for (auto& fiber : fibers)
+    fiber.Join();
+
+  auto res = Run({"lrange", to_string(wave_sizes.size() - 1) + ":0", "0", "-1"});
+  EXPECT_THAT(res.GetVec(), UnorderedElementsAreArray(values));
+}
+
+// Move value back and forth between two lists, verfiy that atomic lookup of states catches it only
+// in one of two possible states
+TEST_F(ListFamilyTest, BLMovePendulum) {
+  GTEST_SKIP() << "Blocking commands don't respect transactional ordering after waking up";
+  // Suppose BLMOVE A -> B is running, then MULTI LLEN A LLEN B EXEC will
+  // 1. Run on shard B because it doesn't have "blocking" keys freely, so LLEN B = 0
+  // 2. Will run on shard A after BLMOVE A removed itself from the "awakened" set, so LLEN A = 0
+  // => we observe a theoretically impossible state and the execution order is not linearizable
+
+  vector<fb2::Fiber> fibers;
+
+  atomic_bool stopped = false;
+  auto swing = [this, &stopped](int i, string src, string dest) {
+    while (!stopped.load(std::memory_order_relaxed))
+      Run(src + dest + to_string(i), {"blmove", src, dest, "LEFT", "RIGHT", "0"});
+  };
+
+  for (int i = 0; i < 3; i++)
+    fibers.emplace_back(pp_->at(i % pp_->size())->LaunchFiber([=]() { swing(i, "A", "B"); }));
+
+  for (int i = 0; i < 3; i++)
+    fibers.emplace_back(pp_->at(i % pp_->size())->LaunchFiber([=]() { swing(i, "B", "A"); }));
+
+  Run({"lpush", "A", "v"});
+  ThisFiber::SleepFor(1ms);
+
+  for (int i = 0; i < 100; i++) {
+    Run({"multi"});
+    Run({"llen", "A"});
+    Run({"llen", "B"});
+    auto res = Run({"EXEC"});
+    int i1 = *res.GetVec()[0].GetInt();
+    int i2 = *res.GetVec()[1].GetInt();
+    ASSERT_EQ(i1 + i2, 1);
+  }
+
+  stopped = true;
+  Run({"lpush", "A", "stop"});
+  Run({"lpush", "B", "stop"});
+  for (auto& fiber : fibers)
+    fiber.Join();
+
+  int i1 = *Run({"llen", "A"}).GetInt();
+  int i2 = *Run({"llen", "B"}).GetInt();
+  ASSERT_EQ(i1 + i2, 3);  // v, stop, stop
+}
+
 TEST_F(ListFamilyTest, LPushX) {
   // No push for 'lpushx' on nonexisting key.
   EXPECT_THAT(Run({"lpushx", kKey1, "val1"}), IntArg(0));
@@ -770,7 +964,7 @@ TEST_F(ListFamilyTest, RPushX) {
 
 TEST_F(ListFamilyTest, LInsert) {
   // List not found.
-  EXPECT_THAT(Run({"linsert", "notfound", "before", "foo", "bar"}), ErrArg("no such key"));
+  EXPECT_THAT(Run({"linsert", "notfound", "before", "foo", "bar"}), IntArg(0));
 
   // Key is not a list.
   Run({"set", "notalist", "x"});
@@ -795,6 +989,14 @@ TEST_F(ListFamilyTest, LInsert) {
 
   // Insert after, pivot not found.
   EXPECT_THAT(Run({"linsert", "mylist", "after", "notfound", "x"}), IntArg(-1));
+
+  // insert empty
+  Run({"rpush", "k", "a"});
+  Run({"linsert", "k", "before", "a", ""});
+  resp = Run({"lpop", "k"});
+  EXPECT_EQ(resp, "");
+  resp = Run({"linsert", "k", "before", "", ""});
+  EXPECT_THAT(resp, IntArg(-1));
 }
 
 TEST_F(ListFamilyTest, BLPopUnwakesInScript) {
@@ -815,7 +1017,7 @@ TEST_F(ListFamilyTest, BLPopUnwakesInScript) {
   });
 
   // Start long running script that intends to wake up blpop
-  auto f2 = pp_->at(2)->LaunchFiber([&]() {
+  auto f2 = pp_->at(2)->LaunchFiber([&] {
     Run("script", {"EVAL", SCRIPT, "5", "a", "b", "c", "d", "l"});
   });
 
@@ -841,7 +1043,7 @@ TEST_F(ListFamilyTest, OtherMultiWakesBLpop) {
   )";
 
   // Start BLPOP with infinite timeout
-  auto f1 = pp_->at(1)->LaunchFiber(Launch::dispatch, [&]() {
+  auto f1 = pp_->at(1)->LaunchFiber(Launch::dispatch, [&] {
     auto resp = Run("blpop", {"BLPOP", "l", "0"});
     // blpop should only be awakened after the script has completed, so the
     // last element added in the script should be returned.
@@ -851,7 +1053,7 @@ TEST_F(ListFamilyTest, OtherMultiWakesBLpop) {
 
   // Start long running script that accesses the list, but should wake up blpop only after it
   // finished
-  auto f2 = pp_->at(2)->LaunchFiber(Launch::dispatch, [&]() {
+  auto f2 = pp_->at(2)->LaunchFiber(Launch::dispatch, [&] {
     Run("script", {"EVAL", SCRIPT, "5", "a", "b", "c", "d", "l"});
   });
 
@@ -862,4 +1064,27 @@ TEST_F(ListFamilyTest, OtherMultiWakesBLpop) {
   f2.Join();
 }
 
+TEST_F(ListFamilyTest, ContendExpire) {
+  vector<fb2::Fiber> blpop_fibers;
+  for (unsigned i = 0; i < num_threads_; ++i) {
+    for (unsigned j = 0; j < 30; ++j) {
+      blpop_fibers.emplace_back(pp_->at(i)->LaunchFiber(Launch::post, [&, i, j] {
+        string keys[2] = {"key0", "key1"};
+        thread_local unsigned cur = 0;
+        for (unsigned n = 0; n < 30; n++) {
+          string k = keys[cur];
+          cur ^= 1;
+          Run(StrCat("push", i, "_", j), {"lpush", k, "foo"});
+          Run(StrCat("blpop", i, "_", j), {"blpop", keys[cur], "a", "0.001"});
+        }
+      }));
+    }
+  }
+
+  for (auto& f : blpop_fibers) {
+    f.Join();
+  }
+}
+
+#pragma GCC diagnostic pop
 }  // namespace dfly

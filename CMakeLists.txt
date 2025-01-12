@@ -18,6 +18,20 @@ if (HAS_USE_AFTER_FREE_WARN)
     set(CMAKE_CXX_FLAGS "-Wno-use-after-free ${CMAKE_CXX_FLAGS}")
 endif()
 
+if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    set(CMAKE_CXX_FLAGS "-Wthread-safety ${CMAKE_CXX_FLAGS}")
+    add_compile_options(-Werror=thread-safety)
+endif()
+
+# We can not use here CHECK_CXX_COMPILER_FLAG because systems that do not support sanitizers
+# fail during linking time.
+set(CMAKE_REQUIRED_FLAGS "-fsanitize=address")
+check_cxx_source_compiles("int main() { return 0; }" SUPPORT_ASAN)
+
+set(CMAKE_REQUIRED_FLAGS "-fsanitize=undefined")
+check_cxx_source_compiles("int main() { return 0; }" SUPPORT_USAN)
+set(CMAKE_REQUIRED_FLAGS "")
+
 # We must define all the required variables from the root cmakefile, otherwise
 # they just disappear.
 set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/helio/cmake" ${CMAKE_MODULE_PATH})
@@ -26,15 +40,23 @@ option(DF_USE_SSL "Provide support for SSL connections" ON)
 
 find_package(OpenSSL)
 
+option(WITH_ASAN "Enable -fsanitize=address" OFF)
+if (SUPPORT_ASAN AND WITH_ASAN)
+  message(STATUS "address sanitizer enabled")
+  set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -fsanitize=address")
+endif()
+
+option(WITH_USAN "Enable -fsanitize=undefined" OFF)
+if (SUPPORT_USAN AND WITH_USAN)
+  message(STATUS "ub sanitizer enabled")
+  set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -fsanitize=undefined")
+endif()
+
 include(third_party)
 include(internal)
-
-set(USE_FB2 ON CACHE BOOL "")
 
 include_directories(src)
 include_directories(helio)
 
 add_subdirectory(helio)
 add_subdirectory(src)
-
-include(cmake/Packing.cmake)

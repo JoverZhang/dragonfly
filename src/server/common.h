@@ -1,4 +1,4 @@
-// Copyright 2022, DragonflyDB authors.  All rights reserved.
+// Copyright 2024, DragonflyDB authors.  All rights reserved.
 // See LICENSE for licensing terms.
 //
 
@@ -9,25 +9,30 @@
 #include <absl/types/span.h>
 
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <string_view>
 #include <vector>
 
-#include "core/fibers.h"
+#include "core/compact_object.h"
 #include "facade/facade_types.h"
 #include "facade/op_status.h"
+#include "helio/io/proc_reader.h"
+#include "util/fibers/fibers.h"
+#include "util/fibers/synchronization.h"
 
 namespace dfly {
 
 enum class ListDir : uint8_t { LEFT, RIGHT };
 
 // Dependent on ExpirePeriod representation of the value.
-constexpr int64_t kMaxExpireDeadlineSec = (1u << 28) - 1;
+constexpr int64_t kMaxExpireDeadlineSec = (1u << 28) - 1;  // 8.5 years
+constexpr int64_t kMaxExpireDeadlineMs = kMaxExpireDeadlineSec * 1000;
 
-using DbIndex = uint16_t;
-using ShardId = uint16_t;
 using LSN = uint64_t;
 using TxId = uint64_t;
 using TxClock = uint64_t;
+using SlotId = std::uint16_t;
 
 using facade::ArgS;
 using facade::CmdArgList;
@@ -35,135 +40,103 @@ using facade::CmdArgVec;
 using facade::MutableSlice;
 using facade::OpResult;
 
-using ArgSlice = absl::Span<const std::string_view>;
 using StringVec = std::vector<std::string>;
 
 // keys are RDB_TYPE_xxx constants.
 using RdbTypeFreqMap = absl::flat_hash_map<unsigned, size_t>;
 
-constexpr DbIndex kInvalidDbId = DbIndex(-1);
-constexpr ShardId kInvalidSid = ShardId(-1);
-constexpr DbIndex kMaxDbId = 1024;  // Reasonable starting point.
-
 class CommandId;
 class Transaction;
 class EngineShard;
+struct ConnectionState;
+class Interpreter;
+class Namespaces;
 
-struct KeyLockArgs {
-  DbIndex db_index = 0;
-  ArgSlice args;
-  unsigned key_step = 1;
+struct LockTagOptions {
+  bool enabled = false;
+  char open_locktag = '{';
+  char close_locktag = '}';
+  unsigned skip_n_end_delimiters = 0;
+  std::string prefix;
+
+  // Returns the tag according to the rules defined by this options object.
+  std::string_view Tag(std::string_view key) const;
+
+  static const LockTagOptions& instance();
 };
-
-// Describes key indices.
-struct KeyIndex {
-  unsigned start;
-  unsigned end;   // does not include this index (open limit).
-  unsigned step;  // 1 for commands like mget. 2 for commands like mset.
-
-  // if index is non-zero then adds another key index (usually 0).
-  // relevant for for commands like ZUNIONSTORE/ZINTERSTORE for destination key.
-  std::optional<uint16_t> bonus{};
-
-  static KeyIndex Empty() {
-    return KeyIndex{0, 0, 0, std::nullopt};
-  }
-
-  static KeyIndex Range(unsigned start, unsigned end, unsigned step = 1) {
-    return KeyIndex{start, end, step, std::nullopt};
-  }
-
-  bool HasSingleKey() const {
-    return !bonus && (start + step >= end);
-  }
-
-  unsigned num_args() const {
-    return end - start + bool(bonus);
-  }
-};
-
-struct DbContext {
-  DbIndex db_index = 0;
-  uint64_t time_now_ms = 0;
-};
-
-struct OpArgs {
-  EngineShard* shard;
-  const Transaction* tx;
-  DbContext db_cntx;
-
-  OpArgs() : shard(nullptr), tx(nullptr) {
-  }
-
-  OpArgs(EngineShard* s, const Transaction* tx, const DbContext& cntx)
-      : shard(s), tx(tx), db_cntx(cntx) {
-  }
-};
-
-// Record non auto journal command with own txid and dbid.
-void RecordJournal(const OpArgs& op_args, std::string_view cmd, ArgSlice args,
-                   uint32_t shard_cnt = 1, bool multi_commands = false);
-
-// Record non auto journal command finish. Call only when command translates to multi commands.
-void RecordJournalFinish(const OpArgs& op_args, uint32_t shard_cnt);
-
-// Record expiry in journal with independent transaction. Must be called from shard thread holding
-// key.
-void RecordExpiry(DbIndex dbid, std::string_view key);
-
-// Trigger journal write to sink, no journal record will be added to journal.
-// Must be called from shard thread of journal to sink.
-void TriggerJournalWriteToSink();
 
 struct TieredStats {
-  size_t tiered_reads = 0;
-  size_t tiered_writes = 0;
+  uint64_t total_stashes = 0;
+  uint64_t total_fetches = 0;
+  uint64_t total_cancels = 0;
+  uint64_t total_deletes = 0;
+  uint64_t total_defrags = 0;
+  uint64_t total_uploads = 0;
+  uint64_t total_registered_buf_allocs = 0;
+  uint64_t total_heap_buf_allocs = 0;
 
-  size_t storage_capacity = 0;
+  // How many times the system did not perform Stash call (disjoint with total_stashes).
+  uint64_t total_stash_overflows = 0;
+  uint64_t total_offloading_steps = 0;
+  uint64_t total_offloading_stashes = 0;
 
-  // how much was reserved by actively stored items.
-  size_t storage_reserved = 0;
-  size_t aborted_write_cnt = 0;
-  size_t flush_skip_cnt = 0;
+  size_t allocated_bytes = 0;
+  size_t capacity_bytes = 0;
+
+  uint32_t pending_read_cnt = 0;
+  uint32_t pending_stash_cnt = 0;
+
+  uint64_t small_bins_cnt = 0;
+  uint64_t small_bins_entries_cnt = 0;
+  size_t small_bins_filling_bytes = 0;
+  size_t cold_storage_bytes = 0;
 
   TieredStats& operator+=(const TieredStats&);
+};
+
+struct SearchStats {
+  size_t used_memory = 0;
+  size_t num_indices = 0;
+  size_t num_entries = 0;
+
+  SearchStats& operator+=(const SearchStats&);
 };
 
 enum class GlobalState : uint8_t {
   ACTIVE,
   LOADING,
-  SAVING,
   SHUTTING_DOWN,
   TAKEN_OVER,
 };
 
+std::ostream& operator<<(std::ostream& os, const GlobalState& state);
+
 enum class TimeUnit : uint8_t { SEC, MSEC };
 
-inline void ToUpper(const MutableSlice* val) {
-  for (auto& c : *val) {
-    c = absl::ascii_toupper(c);
-  }
-}
-
-inline void ToLower(const MutableSlice* val) {
-  for (auto& c : *val) {
-    c = absl::ascii_tolower(c);
-  }
-}
+enum ExpireFlags {
+  EXPIRE_ALWAYS = 0,
+  EXPIRE_NX = 1 << 0,  // Set expiry only when key has no expiry
+  EXPIRE_XX = 1 << 2,  // Set expiry only when the key has expiry
+  EXPIRE_GT = 1 << 3,  // GT: Set expiry only when the new expiry is greater than current one
+  EXPIRE_LT = 1 << 4,  // LT: Set expiry only when the new expiry is less than current one
+};
 
 bool ParseHumanReadableBytes(std::string_view str, int64_t* num_bytes);
 bool ParseDouble(std::string_view src, double* value);
-const char* ObjTypeName(int type);
 
 const char* RdbTypeName(unsigned type);
 
 // Cached values, updated frequently to represent the correct state of the system.
 extern std::atomic_uint64_t used_mem_peak;
 extern std::atomic_uint64_t used_mem_current;
+extern std::atomic_uint64_t rss_mem_current;
+extern std::atomic_uint64_t rss_mem_peak;
+
 extern size_t max_memory_limit;
 
-// malloc memory stats.
-int64_t GetMallocCurrentCommitted();
+size_t FetchRssMemory(io::StatusData sdata);
+
+extern Namespaces* namespaces;
 
 // version 5.11 maps to 511 etc.
 // set upon server start.
@@ -171,24 +144,27 @@ extern unsigned kernel_version;
 
 const char* GlobalStateName(GlobalState gs);
 
-template <typename RandGen> std::string GetRandomHex(RandGen& gen, size_t len) {
+template <typename RandGen>
+std::string GetRandomHex(RandGen& gen, size_t len, size_t len_deviation = 0) {
   static_assert(std::is_same<uint64_t, decltype(gen())>::value);
+  if (len_deviation) {
+    len += (gen() % len_deviation);
+  }
+
   std::string res(len, '\0');
   size_t indx = 0;
 
   for (size_t i = 0; i < len / 16; ++i) {  // 2 chars per byte
-    absl::AlphaNum an(absl::Hex(gen(), absl::kZeroPad16));
-
-    for (unsigned j = 0; j < 16; ++j) {
-      res[indx++] = an.Piece()[j];
-    }
+    absl::numbers_internal::FastHexToBufferZeroPad16(gen(), res.data() + indx);
+    indx += 16;
   }
 
   if (indx < res.size()) {
-    absl::AlphaNum an(absl::Hex(gen(), absl::kZeroPad16));
+    char buf[32];
+    absl::numbers_internal::FastHexToBufferZeroPad16(gen(), buf);
 
     for (unsigned j = 0; indx < res.size(); indx++, j++) {
-      res[indx] = an.Piece()[j];
+      res[indx] = buf[j];
     }
   }
 
@@ -216,7 +192,7 @@ template <typename T> struct AggregateValue {
   }
 
  private:
-  Mutex mu_{};
+  util::fb2::Mutex mu_{};
   T current_{};
 };
 
@@ -291,7 +267,7 @@ class Context : protected Cancellation {
   using Cancellation::IsCancelled;
   const Cancellation* GetCancellation() const;
 
-  GenericError GetError();
+  GenericError GetError() const;
 
   // Report an error by submitting arguments for GenericError.
   // If this is the first error that occured, then the error handler is run
@@ -318,18 +294,18 @@ class Context : protected Cancellation {
   // Report error.
   GenericError ReportErrorInternal(GenericError&& err);
 
- private:
   GenericError err_;
-  Mutex mu_;
-
   ErrHandler err_handler_;
-  Fiber err_handler_fb_;
+  util::fb2::Fiber err_handler_fb_;
+
+  // We use regular mutexes to be able to call ReportError directly from I/O callbacks.
+  mutable std::mutex err_mu_;  // protects err_ and err_handler_
 };
 
 struct ScanOpts {
-  std::string_view pattern;
+  std::optional<std::string_view> pattern;
   size_t limit = 10;
-  std::string_view type_filter;
+  std::optional<CompactObjType> type_filter;
   unsigned bucket_id = UINT_MAX;
 
   bool Matches(std::string_view val_name) const;
@@ -342,5 +318,94 @@ constexpr uint64_t kMemberExpiryBase = 1675209600;
 inline uint32_t MemberTimeSeconds(uint64_t now_ms) {
   return (now_ms / 1000) - kMemberExpiryBase;
 }
+
+struct MemoryBytesFlag {
+  uint64_t value = 0;
+};
+
+bool AbslParseFlag(std::string_view in, dfly::MemoryBytesFlag* flag, std::string* err);
+std::string AbslUnparseFlag(const dfly::MemoryBytesFlag& flag);
+
+// Helper class used to guarantee atomicity between serialization of buckets
+class ABSL_LOCKABLE ThreadLocalMutex {
+ public:
+  ThreadLocalMutex();
+  ~ThreadLocalMutex();
+
+  void lock() ABSL_EXCLUSIVE_LOCK_FUNCTION();
+  void unlock() ABSL_UNLOCK_FUNCTION();
+
+ private:
+  EngineShard* shard_;
+  util::fb2::CondVarAny cond_var_;
+  bool flag_ = false;
+  util::fb2::detail::FiberInterface* locked_fiber_{nullptr};
+};
+
+// Replacement of std::SharedLock that allows -Wthread-safety
+template <typename Mutex> class ABSL_SCOPED_LOCKABLE SharedLock {
+ public:
+  explicit SharedLock(Mutex& m) ABSL_EXCLUSIVE_LOCK_FUNCTION(m) : m_(m) {
+    m_.lock_shared();
+    is_locked_ = true;
+  }
+
+  ~SharedLock() ABSL_UNLOCK_FUNCTION() {
+    if (is_locked_) {
+      m_.unlock_shared();
+    }
+  }
+
+  void unlock() ABSL_UNLOCK_FUNCTION() {
+    m_.unlock_shared();
+    is_locked_ = false;
+  }
+
+ private:
+  Mutex& m_;
+  bool is_locked_;
+};
+
+// Ensures availability of an interpreter for EVAL-like commands and it's automatic release.
+// If it's part of MULTI, the preborrowed interpreter is returned, otherwise a new is acquired.
+struct BorrowedInterpreter {
+  BorrowedInterpreter(Transaction* tx, ConnectionState* state);
+
+  ~BorrowedInterpreter();
+
+  // Give up ownership of the interpreter, it must be returned manually.
+  Interpreter* Release() && {
+    assert(owned_);
+    owned_ = false;
+    return interpreter_;
+  }
+
+  operator Interpreter*() {
+    return interpreter_;
+  }
+
+ private:
+  Interpreter* interpreter_ = nullptr;
+  bool owned_ = false;
+};
+
+class LocalBlockingCounter {
+ public:
+  void lock() {
+    ++mutating_;
+  }
+
+  void unlock();
+
+  void Wait();
+
+  bool IsBlocked() const {
+    return mutating_ > 0;
+  }
+
+ private:
+  util::fb2::CondVarAny cond_var_;
+  size_t mutating_ = 0;
+};
 
 }  // namespace dfly

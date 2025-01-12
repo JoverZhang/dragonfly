@@ -4,9 +4,12 @@
 
 #include "server/journal/serializer.h"
 
-#include "base/io_buf.h"
+#include <system_error>
+
 #include "base/logging.h"
+#include "glog/logging.h"
 #include "io/io.h"
+#include "io/io_buf.h"
 #include "server/common.h"
 #include "server/error.h"
 #include "server/journal/types.h"
@@ -32,36 +35,31 @@ void JournalWriter::Write(std::string_view sv) {
   sink_->Write(io::Buffer(sv));
 }
 
-template <typename C> void JournalWriter::Write(std::pair<std::string_view, C> args) {
-  auto [cmd, tail_args] = args;
+void JournalWriter::Write(const journal::Entry::Payload& payload) {
+  if (payload.cmd.empty())
+    return;
 
-  Write(1 + tail_args.size());
+  size_t num_elems = 0, size = 0;
+  for (string_view str : base::it::Wrap(facade::kToSV, payload.args)) {
+    num_elems++;
+    size += str.size();
+  };
 
-  size_t cmd_size = cmd.size();
-  for (auto v : tail_args) {
-    cmd_size += v.size();
-  }
+  Write(1 + num_elems);
+
+  size_t cmd_size = payload.cmd.size() + size;
   Write(cmd_size);
+  Write(payload.cmd);
 
-  Write(cmd);
-  for (auto v : tail_args) {
-    if constexpr (is_same_v<C, CmdArgList>)
-      Write(facade::ToSV(v));
-    else
-      Write(v);
-  }
-}
-
-template void JournalWriter::Write(pair<string_view, CmdArgList>);
-template void JournalWriter::Write(pair<string_view, ArgSlice>);
-
-void JournalWriter::Write(std::monostate) {
+  for (string_view str : base::it::Wrap(facade::kToSV, payload.args))
+    this->Write(str);
 }
 
 void JournalWriter::Write(const journal::Entry& entry) {
   // Check if entry has a new db index and we need to emit a SELECT entry.
-  if (entry.opcode != journal::Op::SELECT && (!cur_dbid_ || entry.dbid != *cur_dbid_)) {
-    Write(journal::Entry{journal::Op::SELECT, entry.dbid});
+  if (entry.opcode != journal::Op::SELECT && entry.opcode != journal::Op::LSN &&
+      entry.opcode != journal::Op::PING && (!cur_dbid_ || entry.dbid != *cur_dbid_)) {
+    Write(journal::Entry{journal::Op::SELECT, entry.dbid, entry.slot});
     cur_dbid_ = entry.dbid;
   }
 
@@ -72,22 +70,23 @@ void JournalWriter::Write(const journal::Entry& entry) {
   switch (entry.opcode) {
     case journal::Op::SELECT:
       return Write(entry.dbid);
+    case journal::Op::LSN:
+      return Write(entry.lsn);
     case journal::Op::PING:
       return;
     case journal::Op::COMMAND:
     case journal::Op::EXPIRED:
-    case journal::Op::MULTI_COMMAND:
-    case journal::Op::EXEC:
       Write(entry.txid);
       Write(entry.shard_cnt);
-      return std::visit([this](const auto& payload) { return Write(payload); }, entry.payload);
+      Write(entry.payload);
+      break;
     default:
       break;
   };
 }
 
 JournalReader::JournalReader(io::Source* source, DbIndex dbid)
-    : source_{source}, buf_{4_KB}, dbid_{dbid} {
+    : source_{source}, buf_{4096}, dbid_{dbid} {
 }
 
 void JournalReader::SetSource(io::Source* source) {
@@ -106,7 +105,11 @@ std::error_code JournalReader::EnsureRead(size_t num) {
   // Try reading at least how much we need, but possibly more
   uint64_t read;
   SET_OR_RETURN(source_->ReadAtLeast(buf_.AppendBuffer(), remainder), read);
-  CHECK(read >= remainder);
+
+  // Happens on end of stream (for example, a too-small string buffer or a closed socket)
+  if (read < remainder) {
+    return make_error_code(errc::io_error);
+  }
 
   buf_.CommitWrite(read);
   return {};
@@ -137,7 +140,7 @@ template io::Result<uint16_t> JournalReader::ReadUInt<uint16_t>();
 template io::Result<uint32_t> JournalReader::ReadUInt<uint32_t>();
 template io::Result<uint64_t> JournalReader::ReadUInt<uint64_t>();
 
-io::Result<size_t> JournalReader::ReadString(MutableSlice buffer) {
+io::Result<size_t> JournalReader::ReadString(io::MutableBytes buffer) {
   size_t size = 0;
   SET_OR_UNEXPECT(ReadUInt<uint64_t>(), size);
 
@@ -161,17 +164,17 @@ std::error_code JournalReader::ReadCommand(journal::ParsedEntry::CmdData* data) 
   SET_OR_RETURN(ReadUInt<uint64_t>(), cmd_size);
 
   // Read all strings consecutively.
-  data->command_buf = make_unique<char[]>(cmd_size);
-  char* ptr = data->command_buf.get();
+  data->command_buf = make_unique<uint8_t[]>(cmd_size);
+  uint8_t* ptr = data->command_buf.get();
   for (auto& span : data->cmd_args) {
     size_t size;
     SET_OR_RETURN(ReadString({ptr, cmd_size}), size);
     DCHECK(size <= cmd_size);
-    span = MutableSlice{ptr, size};
+    span = string_view{reinterpret_cast<char*>(ptr), size};
     ptr += size;
     cmd_size -= size;
   }
-  return std::error_code{};
+  return {};
 }
 
 io::Result<journal::ParsedEntry> JournalReader::ReadEntry() {
@@ -188,7 +191,12 @@ io::Result<journal::ParsedEntry> JournalReader::ReadEntry() {
   entry.dbid = dbid_;
   entry.opcode = opcode;
 
-  if (opcode == journal::Op::PING) {
+  if (opcode == journal::Op::PING || opcode == journal::Op::FIN) {
+    return entry;
+  }
+
+  if (opcode == journal::Op::LSN) {
+    SET_OR_UNEXPECT(ReadUInt<uint64_t>(), entry.lsn);
     return entry;
   }
 
@@ -196,10 +204,6 @@ io::Result<journal::ParsedEntry> JournalReader::ReadEntry() {
   SET_OR_UNEXPECT(ReadUInt<uint32_t>(), entry.shard_cnt);
 
   VLOG(1) << "Read entry " << entry.ToString();
-
-  if (opcode == journal::Op::EXEC) {
-    return entry;
-  }
 
   auto ec = ReadCommand(&entry.cmd);
   if (ec)
