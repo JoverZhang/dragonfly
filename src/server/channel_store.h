@@ -7,6 +7,7 @@
 
 #include <string_view>
 
+#include "facade/dragonfly_connection.h"
 #include "server/conn_context.h"
 
 namespace dfly {
@@ -39,26 +40,22 @@ class ChannelStore {
   friend class ChannelStoreUpdater;
 
  public:
-  struct Subscriber {
-    Subscriber(ConnectionContext* cntx, uint32_t tid);
-    Subscriber(uint32_t tid);
-
-    Subscriber(Subscriber&&) noexcept = default;
-    Subscriber& operator=(Subscriber&&) noexcept = default;
-
-    Subscriber(const Subscriber&) = delete;
-    void operator=(const Subscriber&) = delete;
+  struct Subscriber : public facade::Connection::WeakRef {
+    Subscriber(WeakRef ref, const std::string& pattern)
+        : facade::Connection::WeakRef(std::move(ref)), pattern(pattern) {
+    }
 
     // Sort by thread-id. Subscriber without owner comes first.
     static bool ByThread(const Subscriber& lhs, const Subscriber& rhs);
+    static bool ByThreadId(const Subscriber& lhs, const unsigned thread);
 
-    ConnectionContext* conn_cntx;
-    BlockingCounter borrow_token;  // to keep connection alive
-    uint32_t thread_id;
     std::string pattern;  // non-empty if registered via psubscribe
   };
 
   ChannelStore();
+
+  // Send messages to channel, block on connection backpressure
+  unsigned SendMessages(std::string_view channel, facade::ArgRange messages) const;
 
   // Fetch all subscribers for channel, including matching patterns.
   std::vector<Subscriber> FetchSubscribers(std::string_view channel) const;
@@ -87,7 +84,7 @@ class ChannelStore {
     SubscribeMap* Get() const;
     void Set(SubscribeMap* sm);
 
-    SubscribeMap* operator->();
+    SubscribeMap* operator->() const;
     const SubscribeMap& operator*() const;
 
    private:
@@ -106,7 +103,7 @@ class ChannelStore {
   // Centralized controller to prevent overlaping updates.
   struct ControlBlock {
     std::atomic<ChannelStore*> most_recent;
-    Mutex update_mu;  // locked during updates.
+    util::fb2::Mutex update_mu;  // locked during updates.
   };
 
  private:

@@ -3,8 +3,8 @@
 //
 
 #pragma once
-
 #include "server/journal/types.h"
+#include "util/fibers/detail/fiber_interface.h"
 #include "util/proactor_pool.h"
 
 namespace dfly {
@@ -19,15 +19,9 @@ class Journal {
 
   Journal();
 
-  // Returns true if journal has been active and changed its state to lameduck mode
-  // and false otherwise.
-  bool EnterLameDuck();  // still logs ongoing transactions but refuses to start new ones.
+  void StartInThread();
 
-  // Requires: journal is in lameduck mode.
   std::error_code Close();
-
-  // Opens journal inside a Dragonfly thread. Must be called in each thread.
-  std::error_code OpenInThread(bool persistent, std::string_view dir);
 
   //******* The following functions must be called in the context of the owning shard *********//
 
@@ -35,28 +29,41 @@ class Journal {
   void UnregisterOnChange(uint32_t id);
   bool HasRegisteredCallbacks() const;
 
-  /*
-  void AddCmd(TxId txid, Op opcode, Span args) {
-    OpArgs(txid, opcode, args);
-  }
+  bool IsLSNInBuffer(LSN lsn) const;
+  std::string_view GetEntry(LSN lsn) const;
 
-  void Lock(TxId txid, Span keys) {
-    OpArgs(txid, Op::LOCK, keys);
-  }
-
-  void Unlock(TxId txid, Span keys) {
-    OpArgs(txid, Op::UNLOCK, keys);
-  }
-*/
   LSN GetLsn() const;
 
-  void RecordEntry(TxId txid, Op opcode, DbIndex dbid, unsigned shard_cnt, Entry::Payload payload,
-                   bool await);
+  void RecordEntry(TxId txid, Op opcode, DbIndex dbid, unsigned shard_cnt,
+                   std::optional<SlotId> slot, Entry::Payload payload);
+
+  void SetFlushMode(bool allow_flush);
 
  private:
-  mutable Mutex state_mu_;
+  mutable util::fb2::Mutex state_mu_;
+};
 
-  std::atomic_bool lameduck_{false};
+class JournalFlushGuard {
+ public:
+  explicit JournalFlushGuard(Journal* journal) : journal_(journal) {
+    if (journal_) {
+      journal_->SetFlushMode(false);
+    }
+    util::fb2::detail::EnterFiberAtomicSection();
+  }
+
+  ~JournalFlushGuard() {
+    util::fb2::detail::LeaveFiberAtomicSection();
+    if (journal_) {
+      journal_->SetFlushMode(true);  // Restore the state on destruction
+    }
+  }
+
+  JournalFlushGuard(const JournalFlushGuard&) = delete;
+  JournalFlushGuard& operator=(const JournalFlushGuard&) = delete;
+
+ private:
+  Journal* journal_;
 };
 
 }  // namespace journal

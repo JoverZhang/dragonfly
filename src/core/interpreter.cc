@@ -4,10 +4,13 @@
 
 #include "core/interpreter.h"
 
+#include <absl/base/casts.h>
 #include <absl/container/fixed_array.h>
 #include <absl/strings/str_cat.h>
 #include <absl/time/clock.h>
+#include <mimalloc.h>
 #include <openssl/evp.h>
+#include <xxhash.h>
 
 #include <cstring>
 #include <optional>
@@ -67,6 +70,39 @@ void PushError(lua_State* lua, string_view error, bool trace = true) {
   lua_settable(lua, -3);
 }
 
+// Custom object explorer that collects all values into string array
+struct StringCollectorTranslator : public ObjectExplorer {
+  void OnString(std::string_view str) final {
+    values.emplace_back(str);
+  }
+  void OnArrayStart(unsigned len) final {
+    CHECK(values.empty());
+    values.reserve(len);
+  }
+  void OnArrayEnd() final {
+  }
+  void OnBool(bool b) final {
+    OnString(absl::AlphaNum(b).Piece());
+  }
+  void OnDouble(double d) final {
+    OnString(absl::AlphaNum(d).Piece());
+  }
+  void OnInt(int64_t val) final {
+    OnString(absl::AlphaNum(val).Piece());
+  }
+  void OnNil() final {
+    OnString("");
+  }
+  void OnStatus(std::string_view str) final {
+    OnString(str);
+  }
+  void OnError(std::string_view str) final {
+    LOG(ERROR) << str;
+  }
+
+  vector<string> values;
+};
+
 class RedisTranslator : public ObjectExplorer {
  public:
   RedisTranslator(lua_State* lua) : lua_(lua) {
@@ -112,7 +148,7 @@ void RedisTranslator::OnString(std::string_view str) {
 }
 
 void RedisTranslator::OnDouble(double d) {
-  static constexpr double kConvertEps = std::numeric_limits<double>::epsilon();
+  const double kConvertEps = std::numeric_limits<double>::epsilon();
 
   double fractpart, intpart;
   fractpart = modf(d, &intpart);
@@ -120,7 +156,7 @@ void RedisTranslator::OnDouble(double d) {
   ArrayPre();
 
   // Convert to integer when possible to allow converting to string without trailing zeros.
-  if (abs(fractpart) < kConvertEps && intpart < std::numeric_limits<lua_Integer>::max() &&
+  if (abs(fractpart) < kConvertEps && intpart < double(std::numeric_limits<lua_Integer>::max()) &&
       intpart > std::numeric_limits<lua_Integer>::min())
     lua_pushinteger(lua_, static_cast<lua_Integer>(d));
   else
@@ -142,7 +178,7 @@ void RedisTranslator::OnNil() {
 
 void RedisTranslator::OnStatus(std::string_view str) {
   CHECK(array_index_.empty()) << "unexpected status";
-  lua_newtable(lua_);
+  lua_createtable(lua_, 0, 1);
   lua_pushstring(lua_, "ok");
   lua_pushlstring(lua_, str.data(), str.size());
   lua_settable(lua_, -3);
@@ -155,7 +191,7 @@ void RedisTranslator::OnError(std::string_view str) {
 
 void RedisTranslator::OnArrayStart(unsigned len) {
   ArrayPre();
-  lua_newtable(lua_);
+  lua_createtable(lua_, len, 0);
   array_index_.push_back(1);
 }
 
@@ -190,8 +226,17 @@ string_view TopSv(lua_State* lua) {
 }
 
 optional<int> FetchKey(lua_State* lua, const char* key) {
+  lua_pushcfunction(lua, [](lua_State* lua) -> int {
+    lua_gettable(lua, -3);
+    return 1;
+  });
   lua_pushstring(lua, key);
-  int type = lua_gettable(lua, -2);
+  int status = lua_pcall(lua, 1, 1, 0);
+  if (status != LUA_OK) {
+    lua_pop(lua, 1);
+    return nullopt;
+  }
+  int type = lua_type(lua, -1);
   if (type == LUA_TNIL) {
     lua_pop(lua, 1);
     return nullopt;
@@ -199,8 +244,8 @@ optional<int> FetchKey(lua_State* lua, const char* key) {
   return type;
 }
 
-void SetGlobalArrayInternal(lua_State* lua, const char* name, MutSliceSpan args) {
-  lua_newtable(lua);
+void SetGlobalArrayInternal(lua_State* lua, const char* name, Interpreter::SliceSpan args) {
+  lua_createtable(lua, args.size(), 0);
   for (size_t j = 0; j < args.size(); j++) {
     lua_pushlstring(lua, args[j].data(), args[j].size());
     lua_rawseti(lua, -2, j + 1);
@@ -211,8 +256,10 @@ void SetGlobalArrayInternal(lua_State* lua, const char* name, MutSliceSpan args)
 /* In case the error set into the Lua stack by PushError() was generated
  * by the non-error-trapping version of redis.pcall(), which is redis.call(),
  * this function will raise the Lua error so that the execution of the
- * script will be halted. */
-int RaiseError(lua_State* lua) {
+ * script will be halted.
+ * This function never returns, it unwinds the Lua call stack until an error handler is found or the
+ * script exits */
+int RaiseErrorAndAbort(lua_State* lua) {
   lua_pushstring(lua, "err");
   lua_gettable(lua, -2);
   return lua_error(lua);
@@ -302,6 +349,80 @@ void ToHex(const uint8_t* src, char* dest) {
   dest[40] = '\0';
 }
 
+int DragonflyHashCommand(lua_State* lua) {
+  XXH64_hash_t hash = absl::bit_cast<XXH64_hash_t>(lua_tointeger(lua, 1));
+  bool requires_sort = lua_toboolean(lua, 2);
+
+  // Pop first two arguments to call RedisGenericCommand from this function with tail
+  lua_remove(lua, 1);
+  lua_remove(lua, 1);
+
+  // Compute key hash, we assume it's always second after the command
+  {
+    size_t len;
+    const char* key = lua_tolstring(lua, 2, &len);
+    hash = XXH64(key, len, hash);
+  }
+
+  // Collect output into custom string collector
+  StringCollectorTranslator translator;
+  void** ptr = static_cast<void**>(lua_getextraspace(lua));
+  reinterpret_cast<Interpreter*>(*ptr)->RedisGenericCommand(false, false, &translator);
+
+  if (requires_sort)
+    sort(translator.values.begin(), translator.values.end());
+
+  // Compute new hash and return it
+  for (string_view str : translator.values)
+    hash = XXH64(str.data(), str.size(), hash);
+
+  lua_pushinteger(lua, absl::bit_cast<lua_Integer>(hash));
+  return 1;
+}
+
+int DragonflyRandstrCommand(lua_State* state) {
+  int argc = lua_gettop(state);
+  lua_Integer dsize = lua_tonumber(state, 1);
+  lua_remove(state, 1);
+
+  std::string buf(dsize, ' ');
+
+  auto push_str = [dsize, state, &buf]() {
+    static const char alphanum[] =
+        "0123456789"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz";
+
+    static const char pattern[] = "DRAGONFLY";
+    constexpr int pattern_len = sizeof(pattern) - 1;
+    constexpr int pattern_interval = 53;
+    for (int i = 0; i < dsize; ++i) {
+      if (i % pattern_interval == 0 && i + pattern_len <= dsize) {
+        // Insert the repeating pattern for better compression of random string.
+        buf.replace(i, pattern_len, pattern, pattern_len);
+        i += pattern_len - 1;  // Adjust index to skip the pattern
+      } else {
+        // Fill the rest with semi-random characters for variation
+        buf[i] = alphanum[rand() % (sizeof(alphanum) - 1)];
+      }
+    }
+    lua_pushlstring(state, buf.c_str(), buf.length());
+  };
+
+  if (argc == 1) {
+    push_str();
+  } else {
+    lua_Integer num = lua_tonumber(state, 1);
+    lua_createtable(state, num, 0);
+    for (int i = 1; i <= num; i++) {
+      push_str();
+      lua_rawseti(state, -2, i);
+    }
+  }
+
+  return 1;
+}
+
 int RedisSha1Command(lua_State* lua) {
   int argc = lua_gettop(lua);
   if (argc != 1) {
@@ -350,16 +471,69 @@ int RedisStatusReplyCommand(lua_State* lua) {
   return SingleFieldTable(lua, "ok");
 }
 
-// const char* kInstanceKey = "_INSTANCE";
+// no-op
+int RedisReplicateCommands(lua_State* lua) {
+  lua_pushinteger(lua, 1);
+  // number of results (the number of elements pushed to the lua stack
+  return 1;
+}
+
+int RedisLogCommand(lua_State* lua) {
+  int argc = lua_gettop(lua);
+  if (argc < 2) {
+    PushError(lua, "redis.log() requires two arguments or more.");
+    return RaiseErrorAndAbort(lua);
+  }
+
+  return 0;
+}
+
+// See https://www.lua.org/manual/5.3/manual.html#lua_Alloc
+void* mimalloc_glue(void* ud, void* ptr, size_t osize, size_t nsize) {
+  (void)ud;
+  if (nsize == 0) {
+    InterpreterManager::tl_stats().used_bytes -= mi_usable_size(ptr);
+    mi_free_size(ptr, osize);
+    return nullptr;
+  } else if (ptr == nullptr) {
+    ptr = mi_malloc(nsize);
+    InterpreterManager::tl_stats().used_bytes += mi_usable_size(ptr);
+    return ptr;
+  } else {
+    InterpreterManager::tl_stats().used_bytes -= mi_usable_size(ptr);
+    ptr = mi_realloc(ptr, nsize);
+    InterpreterManager::tl_stats().used_bytes += mi_usable_size(ptr);
+    return ptr;
+  }
+}
 
 }  // namespace
 
 Interpreter::Interpreter() {
-  lua_ = luaL_newstate();
+  InterpreterManager::tl_stats().interpreter_cnt++;
+
+  lua_ = lua_newstate(mimalloc_glue, nullptr);
   InitLua(lua_);
   void** ptr = static_cast<void**>(lua_getextraspace(lua_));
   *ptr = this;
   // SaveOnRegistry(lua_, kInstanceKey, this);
+
+  /* Register the dragonfly commands table and fields */
+  lua_newtable(lua_);
+
+  /* dragonfly.ihash - compute quick integer hash of command result */
+  lua_pushstring(lua_, "ihash");
+  lua_pushcfunction(lua_, DragonflyHashCommand);
+  lua_settable(lua_, -3);
+
+  /* dragonfly.randstr - generate random string or table of random strings */
+  lua_pushstring(lua_, "randstr");
+  lua_pushcfunction(lua_, DragonflyRandstrCommand);
+  lua_settable(lua_, -3);
+
+  /* Finally set the table as 'dragonfly' global var. */
+  lua_setglobal(lua_, "dragonfly");
+  CHECK(lua_checkstack(lua_, 64));
 
   /* Register the redis commands table and fields */
   lua_newtable(lua_);
@@ -396,12 +570,26 @@ Interpreter::Interpreter() {
   lua_pushcfunction(lua_, RedisStatusReplyCommand);
   lua_settable(lua_, -3);
 
+  /* no-op functions */
+
+  /* redis.replicate_commands*/
+  lua_pushstring(lua_, "replicate_commands");
+  lua_pushcfunction(lua_, RedisReplicateCommands);
+  lua_settable(lua_, -3);
+
+  /* redis.log*/
+  lua_pushstring(lua_, "log");
+  lua_pushcfunction(lua_, RedisLogCommand);
+  lua_settable(lua_, -3);
+
   /* Finally set the table as 'redis' global var. */
   lua_setglobal(lua_, "redis");
   CHECK(lua_checkstack(lua_, 64));
 }
 
 Interpreter::~Interpreter() {
+  InterpreterManager::tl_stats().interpreter_cnt--;
+
   lua_close(lua_);
 }
 
@@ -430,6 +618,8 @@ auto Interpreter::AddFunction(string_view sha, string_view body, string* result)
 }
 
 bool Interpreter::Exists(string_view sha) const {
+  DCHECK(lua_);
+
   if (sha.size() != 40)
     return false;
 
@@ -446,7 +636,7 @@ bool Interpreter::Exists(string_view sha) const {
 }
 
 auto Interpreter::RunFunction(string_view sha, std::string* error) -> RunResult {
-  DVLOG(1) << "RunFunction " << sha << " " << lua_gettop(lua_);
+  DVLOG(2) << "RunFunction " << sha << " " << lua_gettop(lua_);
 
   DCHECK_EQ(40u, sha.size());
 
@@ -477,7 +667,7 @@ auto Interpreter::RunFunction(string_view sha, std::string* error) -> RunResult 
   return err == 0 ? RUN_OK : RUN_ERR;
 }
 
-void Interpreter::SetGlobalArray(const char* name, MutSliceSpan args) {
+void Interpreter::SetGlobalArray(const char* name, SliceSpan args) {
   SetGlobalArrayInternal(lua_, name, args);
 }
 
@@ -584,6 +774,7 @@ bool Interpreter::AddInternal(const char* f_id, string_view body, string* error)
   return true;
 }
 
+// Stack is cleaned for us, we can leave it dirty
 bool Interpreter::IsTableSafe() const {
   auto fres = FetchKey(lua_, "err");
   if (fres && *fres == LUA_TSTRING) {
@@ -595,40 +786,35 @@ bool Interpreter::IsTableSafe() const {
     return true;
   }
 
-  vector<pair<unsigned, unsigned>> lens;
-  unsigned len = lua_rawlen(lua_, -1);
-  unsigned i = 0;
+  // Copy root table because we remove it upon finishing traversal
+  lua_pushnil(lua_);
+  lua_copy(lua_, -2, -1);
 
-  // implement dfs traversal
-  while (true) {
-    while (i < len) {
-      DVLOG(1) << "Stack " << lua_gettop(lua_) << "/" << i << "/" << len;
-      int t = lua_rawgeti(lua_, -1, i + 1);  // push table element
-      if (t == LUA_TTABLE) {
-        if (lens.size() >= 127)  // reached depth 128
-          return false;
+  int depth = 1;
+  lua_pushnil(lua_);
 
-        CHECK(lua_checkstack(lua_, 1));
-        lens.emplace_back(i + 1, len);  // save the parent state.
+  // DFS based on lua stack: [parent-table] [parent-key] [parent-value = table] [key]
+  while (depth > 0) {
+    if (lua_checkstack(lua_, 3) == 0 || depth > 128)
+      return false;
 
-        // reset to iterate on the next table.
-        i = 0;
-        len = lua_rawlen(lua_, -1);
-      } else {
-        lua_pop(lua_, 1);  // pop table element
-        ++i;
-      }
+    bool descending = false;
+    for (; lua_next(lua_, -2) != 0; lua_pop(lua_, 1)) {
+      if (lua_type(lua_, -1) != LUA_TTABLE)
+        continue;
+
+      // If we descend, keep value as new table and push nil for start key
+      depth++;
+      lua_pushnil(lua_);
+      descending = true;
+      break;
     }
 
-    if (lens.empty())  // exit criteria
-      break;
-
-    // unwind to the state before we went down the stack.
-    tie(i, len) = lens.back();
-    lens.pop_back();
-
-    lua_pop(lua_, 1);
-  };
+    if (!descending) {
+      lua_pop(lua_, 1);
+      depth--;
+    }
+  }
 
   return true;
 }
@@ -665,7 +851,29 @@ void Interpreter::SerializeResult(ObjectExplorer* serializer) {
         break;
       }
 
+      fres = FetchKey(lua_, "map");
+      if (fres && *fres == LUA_TTABLE) {
+        // Calculate length of map part, there is sadly no other way
+        unsigned len = 0;
+        for (lua_pushnil(lua_); lua_next(lua_, -2) != 0; lua_pop(lua_, 1))
+          len++;
+
+        serializer->OnMapStart(len);
+        for (lua_pushnil(lua_); lua_next(lua_, -2) != 0;) {
+          // Push key to stack top: key value key
+          lua_pushnil(lua_);
+          lua_copy(lua_, -3, -1);
+          SerializeResult(serializer);  // pops key
+          SerializeResult(serializer);  // pop value
+        }
+        serializer->OnMapEnd();
+
+        lua_pop(lua_, 2);
+        break;
+      }
+
       unsigned len = lua_rawlen(lua_, -1);
+
       serializer->OnArrayStart(len);
       for (unsigned i = 0; i < len; ++i) {
         t = lua_rawgeti(lua_, -1, i + 1);  // push table element
@@ -694,36 +902,16 @@ void Interpreter::ResetStack() {
   lua_settop(lua_, 0);
 }
 
-// Returns number of results, which is always 1 in this case.
-// Please note that lua resets the stack once the function returns so no need
-// to unwind the stack manually in the function (though lua allows doing this).
-int Interpreter::RedisGenericCommand(bool raise_error, bool async) {
-  /* By using Lua debug hooks it is possible to trigger a recursive call
-   * to luaRedisGenericCommand(), which normally should never happen.
-   * To make this function reentrant is futile and makes it slower, but
-   * we should at least detect such a misuse, and abort. */
-  if (cmd_depth_) {
-    const char* recursion_warning =
-        "luaRedisGenericCommand() recursive call detected. "
-        "Are you doing funny stuff with Lua debug hooks?";
-    PushError(lua_, recursion_warning);
-    return 1;
-  }
+void Interpreter::RunGC() {
+  lua_gc(lua_, LUA_GCCOLLECT);
+}
 
-  if (!redis_func_) {
-    PushError(lua_, "internal error - redis function not defined");
-    return raise_error ? RaiseError(lua_) : 1;
-  }
-
-  cmd_depth_++;
+std::optional<absl::FixedArray<std::string_view, 4>> Interpreter::PrepareArgs() {
   int argc = lua_gettop(lua_);
-
   /* Require at least one argument */
   if (argc == 0) {
     PushError(lua_, "Please specify at least one argument for redis.call()");
-    cmd_depth_--;
-
-    return raise_error ? RaiseError(lua_) : 1;
+    return std::nullopt;
   }
 
   size_t blob_len = 0;
@@ -735,7 +923,7 @@ int Interpreter::RedisGenericCommand(bool raise_error, bool async) {
     switch (lua_type(lua_, idx)) {
       case LUA_TNUMBER:
         if (lua_isinteger(lua_, idx)) {
-          blob_len += absl::AlphaNum{lua_tointeger(lua_, idx)}.size();
+          blob_len += absl::AlphaNum(lua_tointeger(lua_, idx)).size();
         } else {
           int fmt_len = absl::SNPrintF(tmpbuf, sizeof(tmpbuf), "%.17g", lua_tonumber(lua_, idx));
           CHECK_GT(fmt_len, 0);
@@ -743,28 +931,29 @@ int Interpreter::RedisGenericCommand(bool raise_error, bool async) {
         }
         continue;
       case LUA_TSTRING:
-        blob_len += lua_rawlen(lua_, idx);
+        blob_len += lua_rawlen(lua_, idx) + 1;
         continue;
       default:
         PushError(lua_, "Lua redis() command arguments must be strings or integers");
-        cmd_depth_--;
-        return raise_error ? RaiseError(lua_) : 1;
+        return std::nullopt;
     }
   }
 
-  char name_buffer[32];               // backing storage for cmd name
-  string buffer(blob_len + 4, '\0');  // backing storage for args
-  absl::FixedArray<absl::Span<char>, 4> args(argc);
-
-  char* cur = buffer.data();
-  char* end = cur + blob_len;
+  absl::FixedArray<string_view, 4> args(argc);
 
   // Copy command name to name_buffer and set it as first arg.
-  unsigned len = lua_rawlen(lua_, 1);
-  DCHECK_LT(len, ABSL_ARRAYSIZE(name_buffer));
-  memcpy(name_buffer, lua_tostring(lua_, 1), len);
-  args[0] = {name_buffer, len};
+  unsigned name_len = lua_rawlen(lua_, 1);
+  if (name_len >= sizeof(name_buffer_)) {
+    PushError(lua_, "Lua redis() command name too long");
+    return std::nullopt;
+  }
 
+  memcpy(name_buffer_, lua_tostring(lua_, 1), name_len);
+  args[0] = {name_buffer_, name_len};
+  buffer_.resize(blob_len + 4, '\0');  // backing storage for args
+
+  char* cur = buffer_.data();
+  char* end = cur + blob_len;
   for (int idx = 2; idx <= argc; idx++) {
     size_t len = 0;
     switch (lua_type(lua_, idx)) {
@@ -782,7 +971,7 @@ int Interpreter::RedisGenericCommand(bool raise_error, bool async) {
         break;
       case LUA_TSTRING:
         len = lua_rawlen(lua_, idx);
-        memcpy(cur, lua_tostring(lua_, idx), len);
+        memcpy(cur, lua_tostring(lua_, idx), len + 1);  // + 1 for null terminator
     };
 
     args[idx - 1] = {cur, len};
@@ -792,20 +981,84 @@ int Interpreter::RedisGenericCommand(bool raise_error, bool async) {
   /* Pop all arguments from the stack, we do not need them anymore
    * and this way we guaranty we will have room on the stack for the result. */
   lua_pop(lua_, argc);
-  RedisTranslator translator(lua_);
-  redis_func_(CallArgs{MutSliceSpan{args}, &buffer, &translator, async, raise_error, &raise_error});
+  return args;
+}
+
+// Calls redis function
+// Returns false if error needs to be raised.
+bool Interpreter::CallRedisFunction(bool raise_error, bool async, ObjectExplorer* explorer,
+                                    SliceSpan args) {
+  // Calling with custom explorer is not supported with errors or async
+  DCHECK(explorer == nullptr || (!raise_error && !async));
+
+  // If no custom explorer is set, use default translator
+  optional<RedisTranslator> translator;
+  if (explorer == nullptr) {
+    translator.emplace(lua_);
+    explorer = &*translator;
+  }
+  cmd_depth_++;
+  redis_func_(CallArgs{args, &buffer_, explorer, async, raise_error, &raise_error});
   cmd_depth_--;
 
+  // Shrink reusable buffer if it's too big.
+  if (buffer_.capacity() > 128) {
+    buffer_.clear();
+    buffer_.shrink_to_fit();
+  }
+
+  if (!translator)
+    return true;
+
   // Raise error for regular 'call' command if needed.
-  if (raise_error && translator.HasError()) {
+  if (raise_error && translator->HasError()) {
     // error is already on top of stack
-    return RaiseError(lua_);
+    return false;
   }
 
   if (!async)
     DCHECK_EQ(1, lua_gettop(lua_));
 
-  return 1;
+  return true;
+}
+
+// Returns number of results, which is always 1 in this case.
+// Please note that lua resets the stack once the function returns so no need
+// to unwind the stack manually in the function (though lua allows doing this).
+int Interpreter::RedisGenericCommand(bool raise_error, bool async, ObjectExplorer* explorer) {
+  /* By using Lua debug hooks it is possible to trigger a recursive call
+   * to luaRedisGenericCommand(), which normally should never happen.
+   * To make this function reentrant is futile and makes it slower, but
+   * we should at least detect such a misuse, and abort. */
+  if (cmd_depth_) {
+    const char* recursion_warning =
+        "luaRedisGenericCommand() recursive call detected. "
+        "Are you doing funny stuff with Lua debug hooks?";
+    PushError(lua_, recursion_warning);
+    return 1;
+  }
+
+  if (!redis_func_) {
+    PushError(lua_, "internal error - redis function not defined");
+    if (raise_error) {
+      return RaiseErrorAndAbort(lua_);
+    }
+    return 1;
+  }
+
+  // IMPORTANT! all allocations within this funciton must be freed
+  // BEFORE calling RaiseErrorAndAbort in case of script error. RaiseErrorAndAbort
+  // uses longjmp which bypasses stack unwinding and skips the destruction of objects.
+  {
+    std::optional<absl::FixedArray<std::string_view, 4>> args = PrepareArgs();
+    if (args.has_value()) {
+      raise_error = !CallRedisFunction(raise_error, async, explorer, SliceSpan{*args});
+    }
+  }
+  if (!raise_error) {
+    return 1;
+  }
+  return RaiseErrorAndAbort(lua_);  // this function never returns, it unwinds the Lua call stack
 }
 
 int Interpreter::RedisCallCommand(lua_State* lua) {
@@ -828,6 +1081,19 @@ int Interpreter::RedisAPCallCommand(lua_State* lua) {
   return reinterpret_cast<Interpreter*>(*ptr)->RedisGenericCommand(false, true);
 }
 
+InterpreterManager::Stats& InterpreterManager::Stats::operator+=(const Stats& other) {
+  this->used_bytes += other.used_bytes;
+  this->interpreter_cnt += other.interpreter_cnt;
+  this->blocked_cnt += other.blocked_cnt;
+
+  return *this;
+}
+
+InterpreterManager::Stats& InterpreterManager::tl_stats() {
+  static thread_local Stats stats;
+  return stats;
+}
+
 Interpreter* InterpreterManager::Get() {
   // Grow if none is available and we have unused capacity left.
   if (available_.empty() && storage_.size() < storage_.capacity()) {
@@ -835,15 +1101,57 @@ Interpreter* InterpreterManager::Get() {
     return &storage_.back();
   }
 
-  waker_.await([this]() { return available_.size() > 0; });
+  bool blocked = waker_.await([this]() { return available_.size() > 0; });
+  tl_stats().blocked_cnt += (uint64_t)blocked;
+
   Interpreter* ir = available_.back();
   available_.pop_back();
   return ir;
 }
 
 void InterpreterManager::Return(Interpreter* ir) {
-  available_.push_back(ir);
-  waker_.notify();
+  if (ir >= storage_.data() && ir < storage_.data() + storage_.size()) {
+    available_.push_back(ir);
+    waker_.notify();
+  } else if (return_untracked_ > 0) {
+    return_untracked_--;
+    if (return_untracked_ == 0) {
+      reset_ec_.notify();
+    }
+  } else {
+    LOG(DFATAL) << "Returning untracked interpreter";
+  }
+}
+
+void InterpreterManager::Reset() {
+  lock_guard guard{reset_mu_};
+
+  // we perform double buffer swapping with storage and wait for the old interepreters to be
+  // returned.
+  return_untracked_ = storage_.size() - available_.size();
+
+  std::vector<Interpreter> next_storage;
+  next_storage.reserve(storage_.capacity());
+  next_storage.resize(storage_.size());
+  next_storage.swap(storage_);
+
+  available_.clear();
+  for (auto& ir : storage_) {
+    available_.push_back(&ir);
+  }
+
+  reset_ec_.await([this]() { return return_untracked_ == 0; });
+  VLOG(1) << "InterpreterManager::Reset ended";
+}
+
+void InterpreterManager::Alter(std::function<void(Interpreter*)> modf) {
+  vector<Interpreter*> taken;
+  swap(taken, available_);  // swap data because modf can preempt
+
+  for (Interpreter* ir : taken) {
+    modf(ir);
+    Return(ir);
+  }
 }
 
 }  // namespace dfly

@@ -18,9 +18,9 @@ extern "C" {
 #include "base/logging.h"
 #include "facade/facade_test.h"  // needed to find operator== for RespExpr.
 #include "io/file.h"
-#include "io/file_util.h"
 #include "server/engine_shard_set.h"
 #include "server/rdb_load.h"
+#include "server/rdb_save.h"
 #include "server/test_utils.h"
 
 using namespace testing;
@@ -32,34 +32,32 @@ using absl::StrCat;
 
 ABSL_DECLARE_FLAG(int32, list_compress_depth);
 ABSL_DECLARE_FLAG(int32, list_max_listpack_size);
-ABSL_DECLARE_FLAG(int, compression_mode);
-ABSL_DECLARE_FLAG(string, dbfilename);
+ABSL_DECLARE_FLAG(dfly::CompressionMode, compression_mode);
 
 namespace dfly {
 
+static const auto kMatchNil = ArgType(RespExpr::NIL);
+
 class RdbTest : public BaseFamilyTest {
  protected:
-  void TearDown();
   void SetUp();
 
   io::FileSource GetSource(string name);
+
+  std::error_code LoadRdb(const string& filename) {
+    return pp_->at(0)->Await([&] {
+      io::FileSource fs = GetSource(filename);
+
+      RdbLoader loader(service_.get());
+      return loader.Load(&fs);
+    });
+  }
 };
 
 void RdbTest::SetUp() {
-  SetFlag(&FLAGS_dbfilename, "rdbtestdump");
-  BaseFamilyTest::SetUp();
-}
-
-void RdbTest::TearDown() {
-  // Disable save on shutdown
-  SetFlag(&FLAGS_dbfilename, "");
-
-  auto rdb_files = io::StatFiles("rdbtestdump*");
-  CHECK(rdb_files);
-  for (const auto& fl : *rdb_files) {
-    unlink(fl.name.c_str());
-  }
-  BaseFamilyTest::TearDown();
+  InitWithDbFilename();
+  CHECK_EQ(zmalloc_used_memory_tl, 0);
+  max_memory_limit = 40000000;
 }
 
 inline const uint8_t* to_byte(const void* s) {
@@ -98,19 +96,12 @@ TEST_F(RdbTest, Crc) {
 }
 
 TEST_F(RdbTest, LoadEmpty) {
-  io::FileSource fs = GetSource("empty.rdb");
-  RdbLoader loader(NULL);
-  auto ec = loader.Load(&fs);
-  CHECK(!ec);
+  auto ec = LoadRdb("empty.rdb");
+  ASSERT_FALSE(ec) << ec;
 }
 
 TEST_F(RdbTest, LoadSmall6) {
-  io::FileSource fs = GetSource("redis6_small.rdb");
-  RdbLoader loader{service_.get()};
-
-  // must run in proactor thread in order to avoid polluting the serverstate
-  // in the main, testing thread.
-  auto ec = pp_->at(0)->Await([&] { return loader.Load(&fs); });
+  auto ec = LoadRdb("redis6_small.rdb");
 
   ASSERT_FALSE(ec) << ec.message();
 
@@ -142,24 +133,26 @@ TEST_F(RdbTest, LoadSmall6) {
 }
 
 TEST_F(RdbTest, Stream) {
-  io::FileSource fs = GetSource("redis6_stream.rdb");
-  RdbLoader loader{service_.get()};
-
-  // must run in proactor thread in order to avoid polluting the serverstate
-  // in the main, testing thread.
-  auto ec = pp_->at(0)->Await([&] { return loader.Load(&fs); });
+  auto ec = LoadRdb("redis6_stream.rdb");
 
   ASSERT_FALSE(ec) << ec.message();
 
   auto resp = Run({"type", "key:10"});
   EXPECT_EQ(resp, "stream");
+
   resp = Run({"xinfo", "groups", "key:0"});
   EXPECT_THAT(resp, ArrLen(2));
+  EXPECT_THAT(resp.GetVec()[0],
+              RespElementsAre("name", "g1", "consumers", 0, "pending", 0, "last-delivered-id",
+                              "1655444851524-3", "entries-read", 128, "lag", 0));
+  EXPECT_THAT(resp.GetVec()[1],
+              RespElementsAre("name", "g2", "consumers", 1, "pending", 0, "last-delivered-id",
+                              "1655444851523-1", "entries-read", kMatchNil, "lag", kMatchNil));
 
   resp = Run({"xinfo", "groups", "key:1"});  // test dereferences array of size 1
-  EXPECT_THAT(resp, ArrLen(8));
-  EXPECT_THAT(resp.GetVec(), ElementsAre("name", "g2", "consumers", IntArg(0), "pending", IntArg(0),
-                                         "last-delivered-id", "1655444851523-1"));
+  EXPECT_THAT(resp, RespElementsAre("name", "g2", "consumers", IntArg(0), "pending", IntArg(0),
+                                    "last-delivered-id", "1655444851523-1", "entries-read",
+                                    kMatchNil, "lag", kMatchNil));
 
   resp = Run({"xinfo", "groups", "key:2"});
   EXPECT_THAT(resp, ArrLen(0));
@@ -174,20 +167,25 @@ TEST_F(RdbTest, ComressionModeSaveDragonflyAndReload) {
   auto resp = Run({"keys", "key:[5-9][0-9][0-9][0-9][0-9]*"});
   EXPECT_EQ(resp.GetVec().size(), 0);
 
-  for (int i = 0; i <= 3; ++i) {
-    SetFlag(&FLAGS_compression_mode, i);
+  for (auto mode : {CompressionMode::NONE, CompressionMode::SINGLE_ENTRY,
+                    CompressionMode::MULTI_ENTRY_ZSTD, CompressionMode::MULTI_ENTRY_LZ4}) {
+    SetFlag(&FLAGS_compression_mode, mode);
     RespExpr resp = Run({"save", "df"});
     ASSERT_EQ(resp, "OK");
 
+    if (mode == CompressionMode::MULTI_ENTRY_ZSTD || mode == CompressionMode::MULTI_ENTRY_LZ4) {
+      EXPECT_GE(GetMetrics().coordinator_stats.compressed_blobs, 1);
+    }
+
     auto save_info = service_->server_family().GetLastSaveInfo();
-    resp = Run({"debug", "load", save_info->file_name});
+    resp = Run({"dfly", "load", save_info.file_name});
     ASSERT_EQ(resp, "OK");
     ASSERT_EQ(50000, CheckedInt({"dbsize"}));
   }
 }
 
 TEST_F(RdbTest, RdbLoaderOnReadCompressedDataShouldNotEnterEnsureReadFlow) {
-  SetFlag(&FLAGS_compression_mode, 2);
+  SetFlag(&FLAGS_compression_mode, CompressionMode::MULTI_ENTRY_ZSTD);
   for (int i = 0; i < 1000; ++i) {
     Run({"set", StrCat(i), "1"});
   }
@@ -195,7 +193,31 @@ TEST_F(RdbTest, RdbLoaderOnReadCompressedDataShouldNotEnterEnsureReadFlow) {
   ASSERT_EQ(resp, "OK");
 
   auto save_info = service_->server_family().GetLastSaveInfo();
-  resp = Run({"debug", "load", save_info->file_name});
+  resp = Run({"dfly", "load", save_info.file_name});
+  ASSERT_EQ(resp, "OK");
+}
+
+TEST_F(RdbTest, SaveLoadSticky) {
+  Run({"set", "a", "1"});
+  Run({"set", "b", "2"});
+  Run({"set", "c", "3"});
+  Run({"stick", "a", "b"});
+  RespExpr resp = Run({"save", "df"});
+  ASSERT_EQ(resp, "OK");
+
+  resp = Run({"debug", "reload"});
+  ASSERT_EQ(resp, "OK");
+  EXPECT_THAT(Run({"get", "a"}), "1");
+  EXPECT_THAT(Run({"get", "b"}), "2");
+  EXPECT_THAT(Run({"get", "c"}), "3");
+  EXPECT_THAT(Run({"stick", "a", "b"}), IntArg(0));
+  EXPECT_THAT(Run({"stick", "c"}), IntArg(1));
+}
+
+TEST_F(RdbTest, ReloadSetSmallStringBug) {
+  auto str = absl::StrCat(std::string(32, 'X'));
+  Run({"set", "small_key", str});
+  auto resp = Run({"debug", "reload"});
   ASSERT_EQ(resp, "OK");
 }
 
@@ -220,6 +242,10 @@ TEST_F(RdbTest, Reload) {
   Run({"zadd", "zs1", "1.1", "a", "-1.1", "b"});
   Run({"zadd", "zs2", "1.1", string(510, 'a'), "-1.1", string(502, 'b')});
 
+  Run({"hset", "large_keyname", string(240, 'X'), "-5"});
+  Run({"hset", "large_keyname", string(240, 'Y'), "-500"});
+  Run({"hset", "large_keyname", string(240, 'Z'), "-50000"});
+
   auto resp = Run({"debug", "reload"});
   ASSERT_EQ(resp, "OK");
 
@@ -230,6 +256,10 @@ TEST_F(RdbTest, Reload) {
   EXPECT_EQ(4, CheckedInt({"LLEN", "list_key2"}));
   EXPECT_EQ(2, CheckedInt({"ZCARD", "zs1"}));
   EXPECT_EQ(2, CheckedInt({"ZCARD", "zs2"}));
+
+  EXPECT_EQ(-5, CheckedInt({"hget", "large_keyname", string(240, 'X')}));
+  EXPECT_EQ(-500, CheckedInt({"hget", "large_keyname", string(240, 'Y')}));
+  EXPECT_EQ(-50000, CheckedInt({"hget", "large_keyname", string(240, 'Z')}));
 }
 
 TEST_F(RdbTest, ReloadTtl) {
@@ -242,10 +272,63 @@ TEST_F(RdbTest, ReloadTtl) {
 TEST_F(RdbTest, ReloadExpired) {
   Run({"set", "key", "val"});
   Run({"expire", "key", "2"});
-  sleep(2);
-  Run({"debug", "reload"});
-  auto resp = Run({"get", "key"});
+  RespExpr resp = Run({"save", "df"});
+  ASSERT_EQ(resp, "OK");
+  auto save_info = service_->server_family().GetLastSaveInfo();
+  AdvanceTime(2000);
+  resp = Run({"dfly", "load", save_info.file_name});
+  ASSERT_EQ(resp, "OK");
+  resp = Run({"get", "key"});
   ASSERT_THAT(resp, ArgType(RespExpr::NIL));
+}
+
+TEST_F(RdbTest, HashmapExpiry) {
+  // Add non-expiring elements
+  Run({"hset", "key", "key1", "val1", "key2", "val2"});
+  Run({"debug", "reload"});
+  EXPECT_THAT(Run({"hgetall", "key"}),
+              RespArray(UnorderedElementsAre("key1", "val1", "key2", "val2")));
+
+  // Add expiring elements
+  Run({"hsetex", "key", "5", "key3", "val3", "key4", "val4"});
+  Run({"debug", "reload"});  // Reload before expiration
+  EXPECT_THAT(Run({"hgetall", "key"}),
+              RespArray(UnorderedElementsAre("key1", "val1", "key2", "val2", "key3", "val3", "key4",
+                                             "val4")));
+  AdvanceTime(10'000);
+  EXPECT_THAT(Run({"hgetall", "key"}),
+              RespArray(UnorderedElementsAre("key1", "val1", "key2", "val2")));
+
+  Run({"hsetex", "key", "5", "key5", "val5", "key6", "val6"});
+  EXPECT_THAT(Run({"hgetall", "key"}),
+              RespArray(UnorderedElementsAre("key1", "val1", "key2", "val2", "key5", "val5", "key6",
+                                             "val6")));
+  AdvanceTime(10'000);
+  Run({"debug", "reload"});  // Reload after expiration
+  EXPECT_THAT(Run({"hgetall", "key"}),
+              RespArray(UnorderedElementsAre("key1", "val1", "key2", "val2")));
+}
+
+TEST_F(RdbTest, SetExpiry) {
+  // Add non-expiring elements
+  Run({"sadd", "key", "key1", "key2"});
+  Run({"debug", "reload"});
+  EXPECT_THAT(Run({"smembers", "key"}), RespArray(UnorderedElementsAre("key1", "key2")));
+
+  // Add expiring elements
+  Run({"saddex", "key", "5", "key3", "key4"});
+  Run({"debug", "reload"});  // Reload before expiration
+  EXPECT_THAT(Run({"smembers", "key"}),
+              RespArray(UnorderedElementsAre("key1", "key2", "key3", "key4")));
+  AdvanceTime(10'000);
+  EXPECT_THAT(Run({"smembers", "key"}), RespArray(UnorderedElementsAre("key1", "key2")));
+
+  Run({"saddex", "key", "5", "key5", "key6"});
+  EXPECT_THAT(Run({"smembers", "key"}),
+              RespArray(UnorderedElementsAre("key1", "key2", "key5", "key6")));
+  AdvanceTime(10'000);
+  Run({"debug", "reload"});  // Reload after expiration
+  EXPECT_THAT(Run({"smembers", "key"}), RespArray(UnorderedElementsAre("key1", "key2")));
 }
 
 TEST_F(RdbTest, SaveFlush) {
@@ -258,13 +341,13 @@ TEST_F(RdbTest, SaveFlush) {
 
   do {
     usleep(10);
-  } while (!service_->server_family().IsSaving());
+  } while (!service_->server_family().TEST_IsSaving());
 
   Run({"flushdb"});
   save_fb.Join();
   auto save_info = service_->server_family().GetLastSaveInfo();
-  ASSERT_EQ(1, save_info->freq_map.size());
-  auto& k_v = save_info->freq_map.front();
+  ASSERT_EQ(1, save_info.freq_map.size());
+  auto& k_v = save_info.freq_map.front();
   EXPECT_EQ("string", k_v.first);
   EXPECT_EQ(500000, k_v.second);
 }
@@ -277,9 +360,9 @@ TEST_F(RdbTest, SaveManyDbs) {
   });
 
   auto metrics = GetMetrics();
-  ASSERT_EQ(2, metrics.db.size());
-  EXPECT_EQ(50000, metrics.db[0].key_count);
-  EXPECT_EQ(10000, metrics.db[1].key_count);
+  ASSERT_EQ(2, metrics.db_stats.size());
+  EXPECT_EQ(50000, metrics.db_stats[0].key_count);
+  EXPECT_EQ(10000, metrics.db_stats[1].key_count);
 
   auto save_fb = pp_->at(0)->LaunchFiber([&] {
     RespExpr resp = Run({"save"});
@@ -288,7 +371,7 @@ TEST_F(RdbTest, SaveManyDbs) {
 
   do {
     usleep(10);
-  } while (!service_->server_family().IsSaving());
+  } while (!service_->server_family().TEST_IsSaving());
 
   pp_->at(1)->Await([&] {
     Run({"select", "1"});
@@ -300,8 +383,8 @@ TEST_F(RdbTest, SaveManyDbs) {
   save_fb.Join();
 
   auto save_info = service_->server_family().GetLastSaveInfo();
-  ASSERT_EQ(1, save_info->freq_map.size());
-  auto& k_v = save_info->freq_map.front();
+  ASSERT_EQ(1, save_info.freq_map.size());
+  auto& k_v = save_info.freq_map.front();
 
   EXPECT_EQ("string", k_v.first);
   EXPECT_EQ(60000, k_v.second);
@@ -309,10 +392,10 @@ TEST_F(RdbTest, SaveManyDbs) {
   EXPECT_EQ(resp, "OK");
 
   metrics = GetMetrics();
-  ASSERT_EQ(2, metrics.db.size());
-  EXPECT_EQ(50000, metrics.db[0].key_count);
-  EXPECT_EQ(10000, metrics.db[1].key_count);
-  if (metrics.db[1].key_count != 10000) {
+  ASSERT_EQ(2, metrics.db_stats.size());
+  EXPECT_EQ(50000, metrics.db_stats[0].key_count);
+  EXPECT_EQ(10000, metrics.db_stats[1].key_count);
+  if (metrics.db_stats[1].key_count != 10000) {
     Run({"select", "1"});
     resp = Run({"scan", "0", "match", "ab*"});
     StringVec vec = StrArray(resp.GetVec()[1]);
@@ -324,11 +407,11 @@ TEST_F(RdbTest, SaveManyDbs) {
 
 TEST_F(RdbTest, HMapBugs) {
   // Force kEncodingStrMap2 encoding.
-  server.hash_max_listpack_value = 0;
+  server.max_map_field_len = 0;
   Run({"hset", "hmap1", "key1", "val", "key2", "val2"});
   Run({"hset", "hmap2", "key1", string(690557, 'a')});
 
-  server.hash_max_listpack_value = 32;
+  server.max_map_field_len = 32;
   Run({"debug", "reload"});
   EXPECT_EQ(2, CheckedInt({"hlen", "hmap1"}));
 }
@@ -345,10 +428,10 @@ TEST_F(RdbTest, Issue1305) {
   */
 
   // Force kEncodingStrMap2 encoding.
-  server.hash_max_listpack_value = 0;
+  server.max_map_field_len = 0;
   Run({"hset", "hmap", "key1", "val", "key2", ""});
 
-  server.hash_max_listpack_value = 32;
+  server.max_map_field_len = 32;
   Run({"debug", "reload"});
   EXPECT_EQ(2, CheckedInt({"hlen", "hmap"}));
 }
@@ -375,12 +458,9 @@ TEST_F(RdbTest, JsonTest) {
 class HllRdbTest : public RdbTest, public testing::WithParamInterface<string> {};
 
 TEST_P(HllRdbTest, Hll) {
-  io::FileSource fs = GetSource("hll.rdb");
-  RdbLoader loader{service_.get()};
-
-  // must run in proactor thread in order to avoid polluting the serverstate
-  // in the main, testing thread.
-  auto ec = pp_->at(0)->Await([&] { return loader.Load(&fs); });
+  LOG(INFO) << " max memory: " << max_memory_limit
+            << " used_mem_current: " << used_mem_current.load();
+  auto ec = LoadRdb("hll.rdb");
 
   ASSERT_FALSE(ec) << ec.message();
 
@@ -399,5 +479,247 @@ TEST_P(HllRdbTest, Hll) {
 }
 
 INSTANTIATE_TEST_SUITE_P(HllRdbTest, HllRdbTest, Values("key-sparse", "key-dense"));
+
+TEST_F(RdbTest, LoadSmall7) {
+  // Contains 3 keys
+  // 1. A list called my-list encoded as RDB_TYPE_LIST_QUICKLIST_2
+  // 2. A hashtable called my-hset encoded as RDB_TYPE_HASH_LISTPACK
+  // 3. A set called my-set encoded as RDB_TYPE_SET_LISTPACK
+  // 4. A zset called my-zset encoded as RDB_TYPE_ZSET_LISTPACK
+  auto ec = LoadRdb("redis7_small.rdb");
+
+  ASSERT_FALSE(ec) << ec.message();
+
+  auto resp = Run({"scan", "0"});
+
+  ASSERT_THAT(resp, ArrLen(2));
+
+  EXPECT_THAT(StrArray(resp.GetVec()[1]),
+              UnorderedElementsAre("my-set", "my-hset", "my-list", "zset"));
+
+  resp = Run({"smembers", "my-set"});
+  ASSERT_THAT(resp, ArgType(RespExpr::ARRAY));
+  EXPECT_THAT(resp.GetVec(), UnorderedElementsAre("redis", "acme"));
+
+  resp = Run({"hgetall", "my-hset"});
+  ASSERT_THAT(resp, ArgType(RespExpr::ARRAY));
+  EXPECT_THAT(resp.GetVec(), UnorderedElementsAre("acme", "44", "field", "22"));
+
+  resp = Run({"lrange", "my-list", "0", "-1"});
+  ASSERT_THAT(resp, ArgType(RespExpr::ARRAY));
+  EXPECT_THAT(resp.GetVec(), UnorderedElementsAre("list1", "list2"));
+
+  resp = Run({"zrange", "zset", "0", "-1"});
+  ASSERT_THAT(resp, ArgType(RespExpr::ARRAY));
+  EXPECT_THAT(resp.GetVec(), ElementsAre("einstein", "schrodinger"));
+}
+
+TEST_F(RdbTest, RedisJson) {
+  // RDB file generated via:
+  // ./redis-server --save "" --appendonly no --loadmodule ../lib/rejson.so
+  // and then:
+  // JSON.SET json-str $ '"hello"'
+  // JSON.SET json-arr $ "[1, true, \"hello\", 3.14]"
+  // JSON.SET json-obj $
+  // '{"company":"DragonflyDB","product":"Dragonfly","website":"https://dragondlydb.io","years-active":[2021,2022,2023,2024,"and
+  // more!"]}'
+  auto ec = LoadRdb("redis_json.rdb");
+
+  ASSERT_FALSE(ec) << ec.message();
+
+  EXPECT_EQ(Run({"JSON.GET", "json-str"}), "\"hello\"");
+  EXPECT_EQ(Run({"JSON.GET", "json-arr"}), "[1,true,\"hello\",3.14]");
+  EXPECT_EQ(Run({"JSON.GET", "json-obj"}),
+            "{\"company\":\"DragonflyDB\",\"product\":\"Dragonfly\",\"website\":\"https://"
+            "dragondlydb.io\",\"years-active\":[2021,2022,2023,2024,\"and more!\"]}");
+}
+
+TEST_F(RdbTest, SBF) {
+  EXPECT_THAT(Run({"BF.ADD", "k", "1"}), IntArg(1));
+  Run({"debug", "reload"});
+  EXPECT_EQ(Run({"type", "k"}), "MBbloom--");
+  EXPECT_THAT(Run({"BF.EXISTS", "k", "1"}), IntArg(1));
+}
+
+TEST_F(RdbTest, DflyLoadAppend) {
+  // Create an RDB with (k1,1) value in it saved as `filename`
+  EXPECT_EQ(Run({"set", "k1", "1"}), "OK");
+  EXPECT_EQ(Run({"save", "df"}), "OK");
+  string filename = service_->server_family().GetLastSaveInfo().file_name;
+
+  // Without APPEND option - db should be flushed
+  EXPECT_EQ(Run({"set", "k1", "TO-BE-FLUSHED"}), "OK");
+  EXPECT_EQ(Run({"set", "k2", "TO-BE-FLUSHED"}), "OK");
+  EXPECT_EQ(Run({"dfly", "load", filename}), "OK");
+  EXPECT_THAT(Run({"dbsize"}), IntArg(1));
+  EXPECT_EQ(Run({"get", "k1"}), "1");
+
+  // With APPEND option - db shouldn't be flushed, but k1 should be overridden
+  EXPECT_EQ(Run({"set", "k1", "TO-BE-OVERRIDDEN"}), "OK");
+  EXPECT_EQ(Run({"set", "k2", "2"}), "OK");
+  EXPECT_EQ(Run({"dfly", "load", filename, "append"}), "OK");
+  EXPECT_THAT(Run({"dbsize"}), IntArg(2));
+  EXPECT_EQ(Run({"get", "k1"}), "1");
+  EXPECT_EQ(Run({"get", "k2"}), "2");
+}
+
+// Tests loading a huge set, where the set is loaded in multiple partial reads.
+TEST_F(RdbTest, LoadHugeSet) {
+  // Add 2 sets with 100k elements each (note must have more than kMaxBlobLen
+  // elements to test partial reads).
+  Run({"debug", "populate", "2", "test", "100", "rand", "type", "set", "elements", "100000"});
+  ASSERT_EQ(100000, CheckedInt({"scard", "test:0"}));
+  ASSERT_EQ(100000, CheckedInt({"scard", "test:1"}));
+
+  RespExpr resp = Run({"save", "df"});
+  ASSERT_EQ(resp, "OK");
+
+  auto save_info = service_->server_family().GetLastSaveInfo();
+  resp = Run({"dfly", "load", save_info.file_name});
+  ASSERT_EQ(resp, "OK");
+
+  ASSERT_EQ(100000, CheckedInt({"scard", "test:0"}));
+  ASSERT_EQ(100000, CheckedInt({"scard", "test:1"}));
+}
+
+// Tests loading a huge hmap, where the map is loaded in multiple partial
+// reads.
+TEST_F(RdbTest, LoadHugeHMap) {
+  // Add 2 sets with 100k elements each (note must have more than kMaxBlobLen
+  // elements to test partial reads).
+  Run({"debug", "populate", "2", "test", "100", "rand", "type", "hash", "elements", "100000"});
+  ASSERT_EQ(100000, CheckedInt({"hlen", "test:0"}));
+  ASSERT_EQ(100000, CheckedInt({"hlen", "test:1"}));
+
+  RespExpr resp = Run({"save", "df"});
+  ASSERT_EQ(resp, "OK");
+
+  auto save_info = service_->server_family().GetLastSaveInfo();
+  resp = Run({"dfly", "load", save_info.file_name});
+  ASSERT_EQ(resp, "OK");
+
+  ASSERT_EQ(100000, CheckedInt({"hlen", "test:0"}));
+  ASSERT_EQ(100000, CheckedInt({"hlen", "test:1"}));
+}
+
+// Tests loading a huge zset, where the zset is loaded in multiple partial
+// reads.
+TEST_F(RdbTest, LoadHugeZSet) {
+  // Add 2 sets with 100k elements each (note must have more than kMaxBlobLen
+  // elements to test partial reads).
+  Run({"debug", "populate", "2", "test", "100", "rand", "type", "zset", "elements", "100000"});
+  ASSERT_EQ(100000, CheckedInt({"zcard", "test:0"}));
+  ASSERT_EQ(100000, CheckedInt({"zcard", "test:1"}));
+
+  RespExpr resp = Run({"save", "df"});
+  ASSERT_EQ(resp, "OK");
+
+  auto save_info = service_->server_family().GetLastSaveInfo();
+  resp = Run({"dfly", "load", save_info.file_name});
+  ASSERT_EQ(resp, "OK");
+
+  ASSERT_EQ(100000, CheckedInt({"zcard", "test:0"}));
+  ASSERT_EQ(100000, CheckedInt({"zcard", "test:1"}));
+}
+
+// Tests loading a huge list, where the list is loaded in multiple partial
+// reads.
+TEST_F(RdbTest, LoadHugeList) {
+  // Add 2 lists with 100k elements each (note must have more than 512*8Kb
+  // elements to test partial reads).
+  Run({"debug", "populate", "2", "test", "100", "rand", "type", "list", "elements", "100000"});
+  ASSERT_EQ(100000, CheckedInt({"llen", "test:0"}));
+  ASSERT_EQ(100000, CheckedInt({"llen", "test:1"}));
+
+  RespExpr resp = Run({"save", "df"});
+  ASSERT_EQ(resp, "OK");
+
+  auto save_info = service_->server_family().GetLastSaveInfo();
+  resp = Run({"dfly", "load", save_info.file_name});
+  ASSERT_EQ(resp, "OK");
+
+  ASSERT_EQ(100000, CheckedInt({"llen", "test:0"}));
+  ASSERT_EQ(100000, CheckedInt({"llen", "test:1"}));
+}
+
+// Tests loading a huge stream, where the stream is loaded in multiple partial
+// reads.
+TEST_F(RdbTest, LoadHugeStream) {
+  TEST_current_time_ms = 1000;
+
+  // Add a huge stream (test:0) with 2000 entries, and 4 1k elements per entry
+  // (note must be more than 512*4kb elements to test partial reads).
+  // We add 2000 entries to the stream to ensure that the stream, because populate strream
+  // adds only a single entry at a time, with multiple elements in it.
+  for (unsigned i = 0; i < 2000; i++) {
+    Run({"debug", "populate", "1", "test", "2000", "rand", "type", "stream", "elements", "4"});
+  }
+  ASSERT_EQ(2000, CheckedInt({"xlen", "test:0"}));
+  Run({"XGROUP", "CREATE", "test:0", "grp1", "0"});
+  Run({"XGROUP", "CREATE", "test:0", "grp2", "0"});
+  Run({"XREADGROUP", "GROUP", "grp1", "Alice", "COUNT", "1", "STREAMS", "test:0", ">"});
+  Run({"XREADGROUP", "GROUP", "grp2", "Alice", "COUNT", "1", "STREAMS", "test:0", ">"});
+
+  auto resp = Run({"xinfo", "stream", "test:0"});
+
+  EXPECT_THAT(
+      resp, RespElementsAre("length", 2000, "radix-tree-keys", 2000, "radix-tree-nodes", 2010,
+                            "last-generated-id", "1000-1999", "max-deleted-entry-id", "0-0",
+                            "entries-added", 2000, "recorded-first-entry-id", "1000-0", "groups", 2,
+                            "first-entry", ArrLen(2), "last-entry", ArrLen(2)));
+
+  resp = Run({"save", "df"});
+  ASSERT_EQ(resp, "OK");
+
+  auto save_info = service_->server_family().GetLastSaveInfo();
+  resp = Run({"dfly", "load", save_info.file_name});
+  ASSERT_EQ(resp, "OK");
+
+  ASSERT_EQ(2000, CheckedInt({"xlen", "test:0"}));
+  resp = Run({"xinfo", "stream", "test:0"});
+  EXPECT_THAT(
+      resp, RespElementsAre("length", 2000, "radix-tree-keys", 2000, "radix-tree-nodes", 2010,
+                            "last-generated-id", "1000-1999", "max-deleted-entry-id", "0-0",
+                            "entries-added", 2000, "recorded-first-entry-id", "1000-0", "groups", 2,
+                            "first-entry", ArrLen(2), "last-entry", ArrLen(2)));
+  resp = Run({"xinfo", "groups", "test:0"});
+  EXPECT_THAT(resp, RespElementsAre(RespElementsAre("name", "grp1", "consumers", 1, "pending", 1,
+                                                    "last-delivered-id", "1000-0", "entries-read",
+                                                    1, "lag", 1999),
+                                    _));
+}
+
+TEST_F(RdbTest, LoadStream2) {
+  auto ec = LoadRdb("RDB_TYPE_STREAM_LISTPACKS_2.rdb");
+  ASSERT_FALSE(ec) << ec.message();
+  auto res = Run({"XINFO", "STREAM", "mystream"});
+  ASSERT_THAT(res.GetVec(),
+              ElementsAre("length", 2, "radix-tree-keys", 1, "radix-tree-nodes", 2,
+                          "last-generated-id", "1732613360686-0", "max-deleted-entry-id", "0-0",
+                          "entries-added", 2, "recorded-first-entry-id", "1732613352350-0",
+                          "groups", 1, "first-entry", RespElementsAre("1732613352350-0", _),
+                          "last-entry", RespElementsAre("1732613360686-0", _)));
+}
+
+TEST_F(RdbTest, LoadStream3) {
+  auto ec = LoadRdb("RDB_TYPE_STREAM_LISTPACKS_3.rdb");
+  ASSERT_FALSE(ec) << ec.message();
+  auto res = Run({"XINFO", "STREAM", "mystream"});
+  ASSERT_THAT(
+      res.GetVec(),
+      ElementsAre("length", 2, "radix-tree-keys", 1, "radix-tree-nodes", 2, "last-generated-id",
+                  "1732614679549-0", "max-deleted-entry-id", "0-0", "entries-added", 2,
+                  "recorded-first-entry-id", "1732614676541-0", "groups", 1, "first-entry",
+                  ArgType(RespExpr::ARRAY), "last-entry", ArgType(RespExpr::ARRAY)));
+}
+
+TEST_F(RdbTest, SnapshotTooBig) {
+  // Run({"debug", "populate", "10000", "foo", "1000"});
+  //  usleep(5000);  // let the stats to sync
+  max_memory_limit = 100000;
+  used_mem_current = 1000000;
+  auto resp = Run({"debug", "reload"});
+  ASSERT_THAT(resp, ErrArg("Out of memory"));
+}
 
 }  // namespace dfly

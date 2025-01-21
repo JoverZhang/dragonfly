@@ -50,7 +50,12 @@
 #elif defined(__APPLE__)
 #include <malloc/malloc.h>
 #define HAVE_MALLOC_SIZE 1
+#ifdef USE_ZMALLOC_MI
+#define zmalloc_size(p) zmalloc_usable_size(p)
+#else
 #define zmalloc_size(p) malloc_size(p)
+#endif
+#define ZMALLOC_LIB "macos"
 #endif
 
 /* On native libc implementations, we should still do our best to provide a
@@ -124,7 +129,7 @@ int zmalloc_get_allocator_wasted_blocks(float ratio, size_t* allocated, size_t* 
  * return 0 if not, 1 if underutilized
  */
 int zmalloc_page_is_underutilized(void *ptr, float ratio);
-// roman: void zlibc_free(void *ptr);
+char *zstrdup(const char *s);
 
 void init_zmalloc_threadlocal(void* heap);
 extern __thread ssize_t zmalloc_used_memory_tl;

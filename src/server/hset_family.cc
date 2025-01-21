@@ -4,20 +4,24 @@
 
 #include "server/hset_family.h"
 
+#include "server/family_utils.h"
+
 extern "C" {
 #include "redis/listpack.h"
-#include "redis/object.h"
 #include "redis/redis_aux.h"
 #include "redis/util.h"
+#include "redis/zmalloc.h"
 }
 
 #include "base/logging.h"
 #include "core/string_map.h"
-#include "facade/error.h"
+#include "facade/cmd_arg_parser.h"
+#include "server/acl/acl_commands_def.h"
 #include "server/command_registry.h"
 #include "server/conn_context.h"
 #include "server/container_utils.h"
 #include "server/engine_shard_set.h"
+#include "server/error.h"
 #include "server/search/doc_index.h"
 #include "server/transaction.h"
 
@@ -26,10 +30,10 @@ using namespace std;
 namespace dfly {
 
 using namespace facade;
+using absl::SimpleAtoi;
 
 namespace {
 
-constexpr size_t kMaxListPackLen = 1024;
 using IncrByParam = std::variant<double, int64_t>;
 using OptStr = std::optional<std::string>;
 enum GetAllMode : uint8_t { FIELDS = 1, VALUES = 2 };
@@ -37,12 +41,12 @@ enum GetAllMode : uint8_t { FIELDS = 1, VALUES = 2 };
 bool IsGoodForListpack(CmdArgList args, const uint8_t* lp) {
   size_t sum = 0;
   for (auto s : args) {
-    if (s.size() > server.hash_max_listpack_value)
+    if (s.size() > server.max_map_field_len)
       return false;
     sum += s.size();
   }
 
-  return lpBytes(const_cast<uint8_t*>(lp)) + sum < kMaxListPackLen;
+  return lpBytes(const_cast<uint8_t*>(lp)) + sum < server.max_listpack_map_bytes;
 }
 
 using container_utils::GetStringMap;
@@ -105,11 +109,19 @@ pair<uint8_t*, bool> LpInsert(uint8_t* lp, string_view field, string_view val, b
   return make_pair(lp, !updated);
 }
 
+size_t EstimateListpackMinBytes(CmdArgList members) {
+  size_t bytes = 0;
+  for (const auto& member : members) {
+    bytes += (member.size() + 1);  // string + at least 1 byte for string header.
+  }
+  return bytes;
+}
+
 size_t HMapLength(const DbContext& db_cntx, const CompactObj& co) {
   void* ptr = co.RObjPtr();
   if (co.Encoding() == kEncodingStrMap2) {
     StringMap* sm = GetStringMap(co, db_cntx);
-    return sm->Size();
+    return sm->UpperBoundSize();
   }
 
   DCHECK_EQ(kEncodingListPack, co.Encoding());
@@ -157,30 +169,34 @@ OpStatus IncrementValue(optional<string_view> prev_val, IncrByParam* param) {
 };
 
 OpStatus OpIncrBy(const OpArgs& op_args, string_view key, string_view field, IncrByParam* param) {
-  auto& db_slice = op_args.shard->db_slice();
-  const auto [it, inserted] = db_slice.AddOrFind(op_args.db_cntx, key);
+  auto& db_slice = op_args.GetDbSlice();
+  auto op_res = db_slice.AddOrFind(op_args.db_cntx, key);
+  RETURN_ON_BAD_STATUS(op_res);
+  if (!op_res) {
+    return op_res.status();
+  }
+  auto& add_res = *op_res;
 
   DbTableStats* stats = db_slice.MutableStats(op_args.db_cntx.db_index);
 
   size_t lpb = 0;
 
-  PrimeValue& pv = it->second;
-  if (inserted) {
+  PrimeValue& pv = add_res.it->second;
+  if (add_res.is_new) {
     pv.InitRobj(OBJ_HASH, kEncodingListPack, lpNew(0));
     stats->listpack_blob_cnt++;
   } else {
     if (pv.ObjType() != OBJ_HASH)
       return OpStatus::WRONG_TYPE;
 
-    op_args.shard->search_indices()->RemoveDoc(key, op_args.db_cntx, it->second);
-    db_slice.PreUpdate(op_args.db_cntx.db_index, it);
+    op_args.shard->search_indices()->RemoveDoc(key, op_args.db_cntx, add_res.it->second);
 
     if (pv.Encoding() == kEncodingListPack) {
       uint8_t* lp = (uint8_t*)pv.RObjPtr();
       lpb = lpBytes(lp);
       stats->listpack_bytes -= lpb;
 
-      if (lpb >= kMaxListPackLen) {
+      if (lpb >= server.max_listpack_map_bytes) {
         stats->listpack_blob_cnt--;
         StringMap* sm = HSetFamily::ConvertToStrMap(lp);
         pv.InitRobj(OBJ_HASH, kEncodingStrMap2, sm);
@@ -195,7 +211,7 @@ OpStatus OpIncrBy(const OpArgs& op_args, string_view key, string_view field, Inc
     uint8_t* lp = (uint8_t*)pv.RObjPtr();
     optional<string_view> res;
 
-    if (!inserted)
+    if (!add_res.is_new)
       res = LpFind(lp, field, intbuf);
 
     OpStatus status = IncrementValue(res, param);
@@ -222,8 +238,11 @@ OpStatus OpIncrBy(const OpArgs& op_args, string_view key, string_view field, Inc
     StringMap* sm = GetStringMap(pv, op_args.db_cntx);
 
     sds val = nullptr;
-    if (!inserted) {
-      val = sm->Find(field);
+    if (!add_res.is_new) {
+      auto it = sm->Find(field);
+      if (it != sm->end()) {
+        val = it->second;
+      }
     }
 
     optional<string_view> sv;
@@ -249,7 +268,6 @@ OpStatus OpIncrBy(const OpArgs& op_args, string_view key, string_view field, Inc
     }
   }
 
-  db_slice.PostUpdate(op_args.db_cntx.db_index, it, key);
   op_args.shard->search_indices()->AddDoc(key, op_args.db_cntx, pv);
 
   return OpStatus::OK;
@@ -265,17 +283,17 @@ OpResult<StringVec> OpScan(const OpArgs& op_args, std::string_view key, uint64_t
    * of returning no or very few elements. (taken from redis code at db.c line 904 */
   constexpr size_t INTERATION_FACTOR = 10;
 
-  OpResult<PrimeIterator> find_res = op_args.shard->db_slice().Find(op_args.db_cntx, key, OBJ_HASH);
+  auto find_res = op_args.GetDbSlice().FindReadOnly(op_args.db_cntx, key, OBJ_HASH);
 
   if (!find_res) {
     DVLOG(1) << "ScanOp: find failed: " << find_res << ", baling out";
     return find_res.status();
   }
 
-  PrimeIterator it = find_res.value();
+  auto it = find_res.value();
   StringVec res;
   uint32_t count = scan_op.limit * HASH_TABLE_ENTRIES_FACTOR;
-  PrimeValue& pv = it->second;
+  const PrimeValue& pv = it->second;
 
   if (pv.Encoding() == kEncodingListPack) {
     uint8_t* lp = (uint8_t*)pv.RObjPtr();
@@ -328,16 +346,15 @@ OpResult<StringVec> OpScan(const OpArgs& op_args, std::string_view key, uint64_t
 OpResult<uint32_t> OpDel(const OpArgs& op_args, string_view key, CmdArgList values) {
   DCHECK(!values.empty());
 
-  auto& db_slice = op_args.shard->db_slice();
-  auto it_res = db_slice.Find(op_args.db_cntx, key, OBJ_HASH);
+  auto& db_slice = op_args.GetDbSlice();
+  auto it_res = db_slice.FindMutable(op_args.db_cntx, key, OBJ_HASH);
 
   if (!it_res)
     return it_res.status();
 
-  op_args.shard->search_indices()->RemoveDoc(key, op_args.db_cntx, (*it_res)->second);
-  db_slice.PreUpdate(op_args.db_cntx.db_index, *it_res);
+  PrimeValue& pv = it_res->it->second;
+  op_args.shard->search_indices()->RemoveDoc(key, op_args.db_cntx, pv);
 
-  PrimeValue& pv = (*it_res)->second;
   unsigned deleted = 0;
   bool key_remove = false;
   DbTableStats* stats = db_slice.MutableStats(op_args.db_cntx.db_index);
@@ -366,7 +383,7 @@ OpResult<uint32_t> OpDel(const OpArgs& op_args, string_view key, CmdArgList valu
       bool res = sm->Erase(ToSV(s));
       if (res) {
         ++deleted;
-        if (sm->Size() == 0) {
+        if (sm->UpperBoundSize() == 0) {
           key_remove = true;
           break;
         }
@@ -374,7 +391,7 @@ OpResult<uint32_t> OpDel(const OpArgs& op_args, string_view key, CmdArgList valu
     }
   }
 
-  db_slice.PostUpdate(op_args.db_cntx.db_index, *it_res, key);
+  it_res->post_updater.Run();
 
   if (!key_remove)
     op_args.shard->search_indices()->AddDoc(key, op_args.db_cntx, pv);
@@ -383,7 +400,7 @@ OpResult<uint32_t> OpDel(const OpArgs& op_args, string_view key, CmdArgList valu
     if (enc == kEncodingListPack) {
       stats->listpack_blob_cnt--;
     }
-    db_slice.Del(op_args.db_cntx.db_index, *it_res);
+    db_slice.Del(op_args.db_cntx, it_res->it);
   } else if (enc == kEncodingListPack) {
     stats->listpack_bytes += lpBytes((uint8_t*)pv.RObjPtr());
   }
@@ -391,16 +408,16 @@ OpResult<uint32_t> OpDel(const OpArgs& op_args, string_view key, CmdArgList valu
   return deleted;
 }
 
-OpResult<vector<OptStr>> OpMGet(const OpArgs& op_args, std::string_view key, CmdArgList fields) {
+OpResult<vector<OptStr>> OpHMGet(const OpArgs& op_args, std::string_view key, CmdArgList fields) {
   DCHECK(!fields.empty());
 
-  auto& db_slice = op_args.shard->db_slice();
-  auto it_res = db_slice.Find(op_args.db_cntx, key, OBJ_HASH);
+  auto& db_slice = op_args.GetDbSlice();
+  auto it_res = db_slice.FindReadOnly(op_args.db_cntx, key, OBJ_HASH);
 
   if (!it_res)
     return it_res.status();
 
-  PrimeValue& pv = (*it_res)->second;
+  const PrimeValue& pv = (*it_res)->second;
 
   std::vector<OptStr> result(fields.size());
 
@@ -441,9 +458,9 @@ OpResult<vector<OptStr>> OpMGet(const OpArgs& op_args, std::string_view key, Cmd
     StringMap* sm = GetStringMap(pv, op_args.db_cntx);
 
     for (size_t i = 0; i < fields.size(); ++i) {
-      sds val = sm->Find(ToSV(fields[i]));
-      if (val) {
-        result[i].emplace(val, sdslen(val));
+      auto it = sm->Find(ToSV(fields[i]));
+      if (it != sm->end()) {
+        result[i].emplace(it->second, sdslen(it->second));
       }
     }
   }
@@ -452,8 +469,8 @@ OpResult<vector<OptStr>> OpMGet(const OpArgs& op_args, std::string_view key, Cmd
 }
 
 OpResult<uint32_t> OpLen(const OpArgs& op_args, string_view key) {
-  auto& db_slice = op_args.shard->db_slice();
-  auto it_res = db_slice.Find(op_args.db_cntx, key, OBJ_HASH);
+  auto& db_slice = op_args.GetDbSlice();
+  auto it_res = db_slice.FindReadOnly(op_args.db_cntx, key, OBJ_HASH);
 
   if (it_res) {
     return HMapLength(op_args.db_cntx, (*it_res)->second);
@@ -465,8 +482,8 @@ OpResult<uint32_t> OpLen(const OpArgs& op_args, string_view key) {
 }
 
 OpResult<int> OpExist(const OpArgs& op_args, string_view key, string_view field) {
-  auto& db_slice = op_args.shard->db_slice();
-  auto it_res = db_slice.Find(op_args.db_cntx, key, OBJ_HASH);
+  auto& db_slice = op_args.GetDbSlice();
+  auto it_res = db_slice.FindReadOnly(op_args.db_cntx, key, OBJ_HASH);
 
   if (!it_res) {
     if (it_res.status() == OpStatus::KEY_NOTFOUND)
@@ -485,12 +502,12 @@ OpResult<int> OpExist(const OpArgs& op_args, string_view key, string_view field)
   DCHECK_EQ(kEncodingStrMap2, pv.Encoding());
   StringMap* sm = GetStringMap(pv, op_args.db_cntx);
 
-  return sm->Find(field) ? 1 : 0;
+  return sm->Contains(field) ? 1 : 0;
 };
 
 OpResult<string> OpGet(const OpArgs& op_args, string_view key, string_view field) {
-  auto& db_slice = op_args.shard->db_slice();
-  auto it_res = db_slice.Find(op_args.db_cntx, key, OBJ_HASH);
+  auto& db_slice = op_args.GetDbSlice();
+  auto it_res = db_slice.FindReadOnly(op_args.db_cntx, key, OBJ_HASH);
   if (!it_res)
     return it_res.status();
 
@@ -508,17 +525,17 @@ OpResult<string> OpGet(const OpArgs& op_args, string_view key, string_view field
 
   DCHECK_EQ(pv.Encoding(), kEncodingStrMap2);
   StringMap* sm = GetStringMap(pv, op_args.db_cntx);
-  sds val = sm->Find(field);
+  auto it = sm->Find(field);
 
-  if (!val)
+  if (it == sm->end())
     return OpStatus::KEY_NOTFOUND;
 
-  return string(val, sdslen(val));
+  return string(it->second, sdslen(it->second));
 }
 
 OpResult<vector<string>> OpGetAll(const OpArgs& op_args, string_view key, uint8_t mask) {
-  auto& db_slice = op_args.shard->db_slice();
-  auto it_res = db_slice.Find(op_args.db_cntx, key, OBJ_HASH);
+  auto& db_slice = op_args.GetDbSlice();
+  auto it_res = db_slice.FindReadOnly(op_args.db_cntx, key, OBJ_HASH);
   if (!it_res) {
     if (it_res.status() == OpStatus::KEY_NOTFOUND)
       return vector<string>{};
@@ -529,7 +546,6 @@ OpResult<vector<string>> OpGetAll(const OpArgs& op_args, string_view key, uint8_
 
   vector<string> res;
   bool keyval = (mask == (FIELDS | VALUES));
-  unsigned index = 0;
 
   if (pv.Encoding() == kEncodingListPack) {
     uint8_t* lp = (uint8_t*)pv.RObjPtr();
@@ -538,6 +554,7 @@ OpResult<vector<string>> OpGetAll(const OpArgs& op_args, string_view key, uint8_
     uint8_t* fptr = lpFirst(lp);
     uint8_t intbuf[LP_INTBUF_SIZE];
 
+    unsigned index = 0;
     while (fptr) {
       if (mask & FIELDS) {
         res[index++] = LpGetView(fptr, intbuf);
@@ -552,24 +569,34 @@ OpResult<vector<string>> OpGetAll(const OpArgs& op_args, string_view key, uint8_
     DCHECK_EQ(pv.Encoding(), kEncodingStrMap2);
     StringMap* sm = GetStringMap(pv, op_args.db_cntx);
 
-    res.resize(sm->Size() * (keyval ? 2 : 1));
+    res.reserve(sm->UpperBoundSize() * (keyval ? 2 : 1));
     for (const auto& k_v : *sm) {
       if (mask & FIELDS) {
-        res[index++].assign(k_v.first, sdslen(k_v.first));
+        res.emplace_back(k_v.first, sdslen(k_v.first));
       }
 
       if (mask & VALUES) {
-        res[index++].assign(k_v.second, sdslen(k_v.second));
+        res.emplace_back(k_v.second, sdslen(k_v.second));
       }
     }
+  }
+
+  // Empty hashmaps must be deleted, this case only triggers for expired values
+  // and the enconding is guaranteed to be a DenseSet since we only support expiring
+  // value with that enconding.
+  if (res.empty()) {
+    // post_updater will run immediately
+    auto it = db_slice.FindMutable(op_args.db_cntx, key).it;
+
+    db_slice.Del(op_args.db_cntx, it);
   }
 
   return res;
 }
 
 OpResult<size_t> OpStrLen(const OpArgs& op_args, string_view key, string_view field) {
-  auto& db_slice = op_args.shard->db_slice();
-  auto it_res = db_slice.Find(op_args.db_cntx, key, OBJ_HASH);
+  auto& db_slice = op_args.GetDbSlice();
+  auto it_res = db_slice.FindReadOnly(op_args.db_cntx, key, OBJ_HASH);
 
   if (!it_res) {
     if (it_res.status() == OpStatus::KEY_NOTFOUND)
@@ -589,8 +616,8 @@ OpResult<size_t> OpStrLen(const OpArgs& op_args, string_view key, string_view fi
   DCHECK_EQ(pv.Encoding(), kEncodingStrMap2);
   StringMap* sm = GetStringMap(pv, op_args.db_cntx);
 
-  sds res = sm->Find(field);
-  return res ? sdslen(res) : 0;
+  auto it = sm->Find(field);
+  return it != sm->end() ? sdslen(it->second) : 0;
 }
 
 struct OpSetParams {
@@ -603,21 +630,18 @@ OpResult<uint32_t> OpSet(const OpArgs& op_args, string_view key, CmdArgList valu
   DCHECK(!values.empty() && 0 == values.size() % 2);
   VLOG(2) << "OpSet(" << key << ")";
 
-  auto& db_slice = op_args.shard->db_slice();
-  pair<PrimeIterator, bool> add_res;
-  try {
-    add_res = db_slice.AddOrFind(op_args.db_cntx, key);
-  } catch (bad_alloc&) {
-    return OpStatus::OUT_OF_MEMORY;
-  }
+  auto& db_slice = op_args.GetDbSlice();
+  auto op_res = db_slice.AddOrFind(op_args.db_cntx, key);
+  RETURN_ON_BAD_STATUS(op_res);
+  auto& add_res = *op_res;
 
   DbTableStats* stats = db_slice.MutableStats(op_args.db_cntx.db_index);
 
   uint8_t* lp = nullptr;
-  PrimeIterator& it = add_res.first;
+  auto& it = add_res.it;
   PrimeValue& pv = it->second;
 
-  if (add_res.second) {  // new key
+  if (add_res.is_new) {
     if (op_sp.ttl == UINT32_MAX) {
       lp = lpNew(0);
       pv.InitRobj(OBJ_HASH, kEncodingListPack, lp);
@@ -625,15 +649,13 @@ OpResult<uint32_t> OpSet(const OpArgs& op_args, string_view key, CmdArgList valu
       stats->listpack_blob_cnt++;
       stats->listpack_bytes += lpBytes(lp);
     } else {
-      StringMap* sm = new StringMap(CompactObj::memory_resource());
-      pv.InitRobj(OBJ_HASH, kEncodingStrMap2, sm);
+      pv.InitRobj(OBJ_HASH, kEncodingStrMap2, CompactObj::AllocateMR<StringMap>());
     }
   } else {
     if (pv.ObjType() != OBJ_HASH)
       return OpStatus::WRONG_TYPE;
 
     op_args.shard->search_indices()->RemoveDoc(key, op_args.db_cntx, it->second);
-    db_slice.PreUpdate(op_args.db_cntx.db_index, it);
   }
 
   if (pv.Encoding() == kEncodingListPack) {
@@ -652,6 +674,11 @@ OpResult<uint32_t> OpSet(const OpArgs& op_args, string_view key, CmdArgList valu
 
   if (lp) {
     bool inserted;
+    size_t malloc_reserved = zmalloc_size(lp);
+    size_t min_sz = EstimateListpackMinBytes(values);
+    if (min_sz > malloc_reserved) {
+      lp = (uint8_t*)zrealloc(lp, min_sz);
+    }
     for (size_t i = 0; i < values.size(); i += 2) {
       tie(lp, inserted) = LpInsert(lp, ArgS(values, i), ArgS(values, i + 1), op_sp.skip_if_exists);
       created += inserted;
@@ -661,77 +688,102 @@ OpResult<uint32_t> OpSet(const OpArgs& op_args, string_view key, CmdArgList valu
   } else {
     DCHECK_EQ(kEncodingStrMap2, pv.Encoding());  // Dictionary
     StringMap* sm = GetStringMap(pv, op_args.db_cntx);
-
+    sm->Reserve(values.size() / 2);
     bool added;
 
     for (size_t i = 0; i < values.size(); i += 2) {
+      string_view field = ToSV(values[i]);
+      string_view value = ToSV(values[i + 1]);
       if (op_sp.skip_if_exists)
-        added = sm->AddOrSkip(ToSV(values[i]), ToSV(values[i + 1]), op_sp.ttl);
+        added = sm->AddOrSkip(field, value, op_sp.ttl);
       else
-        added = sm->AddOrUpdate(ToSV(values[i]), ToSV(values[i + 1]), op_sp.ttl);
+        added = sm->AddOrUpdate(field, value, op_sp.ttl);
 
       created += unsigned(added);
     }
   }
 
-  db_slice.PostUpdate(op_args.db_cntx.db_index, it, key);
   op_args.shard->search_indices()->AddDoc(key, op_args.db_cntx, pv);
 
   return created;
 }
 
-void HGetGeneric(CmdArgList args, ConnectionContext* cntx, uint8_t getall_mask) {
+void HGetGeneric(CmdArgList args, uint8_t getall_mask, Transaction* tx, SinkReplyBuilder* builder) {
   string_view key = ArgS(args, 0);
 
   auto cb = [&](Transaction* t, EngineShard* shard) {
     return OpGetAll(t->GetOpArgs(shard), key, getall_mask);
   };
 
-  OpResult<vector<string>> result = cntx->transaction->ScheduleSingleHopT(std::move(cb));
+  OpResult<vector<string>> result = tx->ScheduleSingleHopT(std::move(cb));
 
+  auto* rb = static_cast<RedisReplyBuilder*>(builder);
   if (result) {
     bool is_map = (getall_mask == (VALUES | FIELDS));
-    (*cntx)->SendStringArr(absl::Span<const string>{*result},
-                           is_map ? RedisReplyBuilder::MAP : RedisReplyBuilder::ARRAY);
+    rb->SendBulkStrArr(absl::Span<const string>{*result},
+                       is_map ? RedisReplyBuilder::MAP : RedisReplyBuilder::ARRAY);
   } else {
-    (*cntx)->SendError(result.status());
+    builder->SendError(result.status());
   }
 }
 
-// HSETEX key tll_sec field value field value ...
-void HSetEx(CmdArgList args, ConnectionContext* cntx) {
-  if (args.size() % 2 != 0) {
-    return (*cntx)->SendError(facade::WrongNumArgsError(cntx->cid->name()), kSyntaxErrType);
+OpResult<vector<long>> OpHExpire(const OpArgs& op_args, string_view key, uint32_t ttl_sec,
+                                 CmdArgList values) {
+  auto& db_slice = op_args.GetDbSlice();
+  auto op_res = db_slice.FindMutable(op_args.db_cntx, key, OBJ_HASH);
+
+  if (!op_res) {
+    if (op_res.status() == OpStatus::KEY_NOTFOUND) {
+      std::vector<long> res(values.size(), -2);
+      return res;
+    }
+    return op_res.status();
   }
 
-  string_view key = ArgS(args, 0);
-  string_view ttl_str = ArgS(args, 1);
+  PrimeValue* pv = &((*op_res).it->second);
+  return HSetFamily::SetFieldsExpireTime(op_args, ttl_sec, key, values, pv);
+}
+
+// HSETEX key [NX] tll_sec field value field value ...
+void HSetEx(CmdArgList args, const CommandContext& cmd_cntx) {
+  CmdArgParser parser{args};
+
+  string_view key = parser.Next();
+
+  bool skip_if_exists = static_cast<bool>(parser.Check("NX"sv));
+  string_view ttl_str = parser.Next();
+
   uint32_t ttl_sec;
   constexpr uint32_t kMaxTtl = (1UL << 26);
 
   if (!absl::SimpleAtoi(ttl_str, &ttl_sec) || ttl_sec == 0 || ttl_sec > kMaxTtl) {
-    return (*cntx)->SendError(kInvalidIntErr);
+    return cmd_cntx.rb->SendError(kInvalidIntErr);
   }
 
-  args.remove_prefix(2);
-  OpSetParams op_sp;
-  op_sp.ttl = ttl_sec;
+  CmdArgList fields = parser.Tail();
+
+  if (fields.size() % 2 != 0) {
+    return cmd_cntx.rb->SendError(facade::WrongNumArgsError(cmd_cntx.conn_cntx->cid->name()),
+                                  kSyntaxErrType);
+  }
+
+  OpSetParams op_sp{skip_if_exists, ttl_sec};
 
   auto cb = [&](Transaction* t, EngineShard* shard) {
-    return OpSet(t->GetOpArgs(shard), key, args, op_sp);
+    return OpSet(t->GetOpArgs(shard), key, fields, op_sp);
   };
 
-  OpResult<uint32_t> result = cntx->transaction->ScheduleSingleHopT(std::move(cb));
+  OpResult<uint32_t> result = cmd_cntx.tx->ScheduleSingleHopT(std::move(cb));
   if (result) {
-    (*cntx)->SendLong(*result);
+    cmd_cntx.rb->SendLong(*result);
   } else {
-    (*cntx)->SendError(result.status());
+    cmd_cntx.rb->SendError(result.status());
   }
 }
 
 }  // namespace
 
-void HSetFamily::HDel(CmdArgList args, ConnectionContext* cntx) {
+void HSetFamily::HDel(CmdArgList args, const CommandContext& cmd_cntx) {
   string_view key = ArgS(args, 0);
 
   args.remove_prefix(1);
@@ -739,28 +791,28 @@ void HSetFamily::HDel(CmdArgList args, ConnectionContext* cntx) {
     return OpDel(t->GetOpArgs(shard), key, args);
   };
 
-  OpResult<uint32_t> result = cntx->transaction->ScheduleSingleHopT(std::move(cb));
+  OpResult<uint32_t> result = cmd_cntx.tx->ScheduleSingleHopT(std::move(cb));
   if (result || result.status() == OpStatus::KEY_NOTFOUND) {
-    (*cntx)->SendLong(*result);
+    cmd_cntx.rb->SendLong(*result);
   } else {
-    (*cntx)->SendError(result.status());
+    cmd_cntx.rb->SendError(result.status());
   }
 }
 
-void HSetFamily::HLen(CmdArgList args, ConnectionContext* cntx) {
+void HSetFamily::HLen(CmdArgList args, const CommandContext& cmd_cntx) {
   string_view key = ArgS(args, 0);
 
   auto cb = [&](Transaction* t, EngineShard* shard) { return OpLen(t->GetOpArgs(shard), key); };
 
-  OpResult<uint32_t> result = cntx->transaction->ScheduleSingleHopT(std::move(cb));
+  OpResult<uint32_t> result = cmd_cntx.tx->ScheduleSingleHopT(std::move(cb));
   if (result) {
-    (*cntx)->SendLong(*result);
+    cmd_cntx.rb->SendLong(*result);
   } else {
-    (*cntx)->SendError(result.status());
+    cmd_cntx.rb->SendError(result.status());
   }
 }
 
-void HSetFamily::HExists(CmdArgList args, ConnectionContext* cntx) {
+void HSetFamily::HExists(CmdArgList args, const CommandContext& cmd_cntx) {
   string_view key = ArgS(args, 0);
   string_view field = ArgS(args, 1);
 
@@ -768,48 +820,91 @@ void HSetFamily::HExists(CmdArgList args, ConnectionContext* cntx) {
     return OpExist(t->GetOpArgs(shard), key, field);
   };
 
-  OpResult<int> result = cntx->transaction->ScheduleSingleHopT(std::move(cb));
+  OpResult<int> result = cmd_cntx.tx->ScheduleSingleHopT(std::move(cb));
   if (result) {
-    (*cntx)->SendLong(*result);
+    cmd_cntx.rb->SendLong(*result);
   } else {
-    (*cntx)->SendError(result.status());
+    cmd_cntx.rb->SendError(result.status());
   }
 }
 
-void HSetFamily::HMGet(CmdArgList args, ConnectionContext* cntx) {
+void HSetFamily::HExpire(CmdArgList args, const CommandContext& cmd_cntx) {
+  CmdArgParser parser{args};
+  string_view key = parser.Next();
+  string_view ttl_str = parser.Next();
+  uint32_t ttl_sec;
+  constexpr uint32_t kMaxTtl = (1UL << 26);
+  if (!absl::SimpleAtoi(ttl_str, &ttl_sec) || ttl_sec == 0 || ttl_sec > kMaxTtl) {
+    return cmd_cntx.rb->SendError(kInvalidIntErr);
+  }
+  if (!static_cast<bool>(parser.Check("FIELDS"sv))) {
+    return cmd_cntx.rb->SendError(
+        "Mandatory argument FIELDS is missing or not at the right position", kSyntaxErrType);
+  }
+
+  string_view numFieldsStr = parser.Next();
+  uint32_t numFields;
+  if (!absl::SimpleAtoi(numFieldsStr, &numFields) || numFields == 0) {
+    return cmd_cntx.rb->SendError(kInvalidIntErr);
+  }
+
+  CmdArgList fields = parser.Tail();
+  if (fields.size() != numFields) {
+    return cmd_cntx.rb->SendError("The `numfields` parameter must match the number of arguments",
+                                  kSyntaxErrType);
+  }
+
+  auto cb = [&](Transaction* t, EngineShard* shard) {
+    return OpHExpire(t->GetOpArgs(shard), key, ttl_sec, fields);
+  };
+
+  OpResult<vector<long>> result = cmd_cntx.tx->ScheduleSingleHopT(std::move(cb));
+  auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx.rb);
+  if (result) {
+    rb->StartArray(result->size());
+    const auto& array = result.value();
+    for (const auto& v : array) {
+      rb->SendLong(v);
+    }
+  } else {
+    cmd_cntx.rb->SendError(result.status());
+  }
+}
+
+void HSetFamily::HMGet(CmdArgList args, const CommandContext& cmd_cntx) {
   string_view key = ArgS(args, 0);
 
   args.remove_prefix(1);
   auto cb = [&](Transaction* t, EngineShard* shard) {
-    return OpMGet(t->GetOpArgs(shard), key, args);
+    return OpHMGet(t->GetOpArgs(shard), key, args);
   };
 
-  OpResult<vector<OptStr>> result = cntx->transaction->ScheduleSingleHopT(std::move(cb));
+  OpResult<vector<OptStr>> result = cmd_cntx.tx->ScheduleSingleHopT(std::move(cb));
 
+  auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx.rb);
   if (result) {
-    SinkReplyBuilder::ReplyAggregator agg(cntx->reply_builder());
-
-    (*cntx)->StartArray(result->size());
+    SinkReplyBuilder::ReplyAggregator agg(rb);
+    rb->StartArray(result->size());
     for (const auto& val : *result) {
       if (val) {
-        (*cntx)->SendBulkString(*val);
+        rb->SendBulkString(*val);
       } else {
-        (*cntx)->SendNull();
+        rb->SendNull();
       }
     }
   } else if (result.status() == OpStatus::KEY_NOTFOUND) {
-    SinkReplyBuilder::ReplyAggregator agg(cntx->reply_builder());
+    SinkReplyBuilder::ReplyAggregator agg(rb);
 
-    (*cntx)->StartArray(args.size());
+    rb->StartArray(args.size());
     for (unsigned i = 0; i < args.size(); ++i) {
-      (*cntx)->SendNull();
+      rb->SendNull();
     }
   } else {
-    (*cntx)->SendError(result.status());
+    cmd_cntx.rb->SendError(result.status());
   }
 }
 
-void HSetFamily::HGet(CmdArgList args, ConnectionContext* cntx) {
+void HSetFamily::HGet(CmdArgList args, const CommandContext& cmd_cntx) {
   string_view key = ArgS(args, 0);
   string_view field = ArgS(args, 1);
 
@@ -817,26 +912,27 @@ void HSetFamily::HGet(CmdArgList args, ConnectionContext* cntx) {
     return OpGet(t->GetOpArgs(shard), key, field);
   };
 
-  OpResult<string> result = cntx->transaction->ScheduleSingleHopT(std::move(cb));
+  auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx.rb);
+  OpResult<string> result = cmd_cntx.tx->ScheduleSingleHopT(std::move(cb));
   if (result) {
-    (*cntx)->SendBulkString(*result);
+    rb->SendBulkString(*result);
   } else {
     if (result.status() == OpStatus::KEY_NOTFOUND) {
-      (*cntx)->SendNull();
+      rb->SendNull();
     } else {
-      (*cntx)->SendError(result.status());
+      cmd_cntx.rb->SendError(result.status());
     }
   }
 }
 
-void HSetFamily::HIncrBy(CmdArgList args, ConnectionContext* cntx) {
+void HSetFamily::HIncrBy(CmdArgList args, const CommandContext& cmd_cntx) {
   string_view key = ArgS(args, 0);
   string_view field = ArgS(args, 1);
   string_view incrs = ArgS(args, 2);
   int64_t ival = 0;
 
   if (!absl::SimpleAtoi(incrs, &ival)) {
-    return (*cntx)->SendError(kInvalidIntErr);
+    return cmd_cntx.rb->SendError(kInvalidIntErr);
   }
 
   IncrByParam param{ival};
@@ -845,33 +941,33 @@ void HSetFamily::HIncrBy(CmdArgList args, ConnectionContext* cntx) {
     return OpIncrBy(t->GetOpArgs(shard), key, field, &param);
   };
 
-  OpStatus status = cntx->transaction->ScheduleSingleHop(std::move(cb));
+  OpStatus status = cmd_cntx.tx->ScheduleSingleHop(std::move(cb));
 
   if (status == OpStatus::OK) {
-    (*cntx)->SendLong(get<int64_t>(param));
+    cmd_cntx.rb->SendLong(get<int64_t>(param));
   } else {
     switch (status) {
       case OpStatus::INVALID_VALUE:
-        (*cntx)->SendError("hash value is not an integer");
+        cmd_cntx.rb->SendError("hash value is not an integer");
         break;
       case OpStatus::OUT_OF_RANGE:
-        (*cntx)->SendError(kIncrOverflow);
+        cmd_cntx.rb->SendError(kIncrOverflow);
         break;
       default:
-        (*cntx)->SendError(status);
+        cmd_cntx.rb->SendError(status);
         break;
     }
   }
 }
 
-void HSetFamily::HIncrByFloat(CmdArgList args, ConnectionContext* cntx) {
+void HSetFamily::HIncrByFloat(CmdArgList args, const CommandContext& cmd_cntx) {
   string_view key = ArgS(args, 0);
   string_view field = ArgS(args, 1);
   string_view incrs = ArgS(args, 2);
   double dval = 0;
 
   if (!absl::SimpleAtod(incrs, &dval)) {
-    return (*cntx)->SendError(kInvalidFloatErr);
+    return cmd_cntx.rb->SendError(kInvalidFloatErr);
   }
 
   IncrByParam param{dval};
@@ -880,54 +976,55 @@ void HSetFamily::HIncrByFloat(CmdArgList args, ConnectionContext* cntx) {
     return OpIncrBy(t->GetOpArgs(shard), key, field, &param);
   };
 
-  OpStatus status = cntx->transaction->ScheduleSingleHop(std::move(cb));
+  OpStatus status = cmd_cntx.tx->ScheduleSingleHop(std::move(cb));
 
   if (status == OpStatus::OK) {
-    (*cntx)->SendDouble(get<double>(param));
+    auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx.rb);
+    rb->SendDouble(get<double>(param));
   } else {
     switch (status) {
       case OpStatus::INVALID_VALUE:
-        (*cntx)->SendError("hash value is not a float");
+        cmd_cntx.rb->SendError("hash value is not a float");
         break;
       default:
-        (*cntx)->SendError(status);
+        cmd_cntx.rb->SendError(status);
         break;
     }
   }
 }
 
-void HSetFamily::HKeys(CmdArgList args, ConnectionContext* cntx) {
-  HGetGeneric(args, cntx, FIELDS);
+void HSetFamily::HKeys(CmdArgList args, const CommandContext& cmd_cntx) {
+  HGetGeneric(args, FIELDS, cmd_cntx.tx, cmd_cntx.rb);
 }
 
-void HSetFamily::HVals(CmdArgList args, ConnectionContext* cntx) {
-  HGetGeneric(args, cntx, VALUES);
+void HSetFamily::HVals(CmdArgList args, const CommandContext& cmd_cntx) {
+  HGetGeneric(args, VALUES, cmd_cntx.tx, cmd_cntx.rb);
 }
 
-void HSetFamily::HGetAll(CmdArgList args, ConnectionContext* cntx) {
-  HGetGeneric(args, cntx, GetAllMode::FIELDS | GetAllMode::VALUES);
+void HSetFamily::HGetAll(CmdArgList args, const CommandContext& cmd_cntx) {
+  HGetGeneric(args, GetAllMode::FIELDS | GetAllMode::VALUES, cmd_cntx.tx, cmd_cntx.rb);
 }
 
-void HSetFamily::HScan(CmdArgList args, ConnectionContext* cntx) {
+void HSetFamily::HScan(CmdArgList args, const CommandContext& cmd_cntx) {
   std::string_view key = ArgS(args, 0);
   std::string_view token = ArgS(args, 1);
 
   uint64_t cursor = 0;
 
   if (!absl::SimpleAtoi(token, &cursor)) {
-    return (*cntx)->SendError("invalid cursor");
+    return cmd_cntx.rb->SendError("invalid cursor");
   }
 
   // HSCAN key cursor [MATCH pattern] [COUNT count]
   if (args.size() > 6) {
     DVLOG(1) << "got " << args.size() << " this is more than it should be";
-    return (*cntx)->SendError(kSyntaxErr);
+    return cmd_cntx.rb->SendError(kSyntaxErr);
   }
 
   OpResult<ScanOpts> ops = ScanOpts::TryFrom(args.subspan(2));
   if (!ops) {
     DVLOG(1) << "HScan invalid args - return " << ops << " to the user";
-    return (*cntx)->SendError(ops.status());
+    return cmd_cntx.rb->SendError(ops.status());
   }
 
   ScanOpts scan_op = ops.value();
@@ -936,26 +1033,27 @@ void HSetFamily::HScan(CmdArgList args, ConnectionContext* cntx) {
     return OpScan(t->GetOpArgs(shard), key, &cursor, scan_op);
   };
 
-  OpResult<StringVec> result = cntx->transaction->ScheduleSingleHopT(std::move(cb));
+  auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx.rb);
+  OpResult<StringVec> result = cmd_cntx.tx->ScheduleSingleHopT(std::move(cb));
   if (result.status() != OpStatus::WRONG_TYPE) {
-    (*cntx)->StartArray(2);
-    (*cntx)->SendBulkString(absl::StrCat(cursor));
-    (*cntx)->StartArray(result->size());  // Within scan the page type is array
+    rb->StartArray(2);
+    rb->SendBulkString(absl::StrCat(cursor));
+    rb->StartArray(result->size());  // Within scan the page type is array
     for (const auto& k : *result) {
-      (*cntx)->SendBulkString(k);
+      rb->SendBulkString(k);
     }
   } else {
-    (*cntx)->SendError(result.status());
+    cmd_cntx.rb->SendError(result.status());
   }
 }
 
-void HSetFamily::HSet(CmdArgList args, ConnectionContext* cntx) {
+void HSetFamily::HSet(CmdArgList args, const CommandContext& cmd_cntx) {
   string_view key = ArgS(args, 0);
 
-  string_view cmd{cntx->cid->name()};
+  string_view cmd{cmd_cntx.conn_cntx->cid->name()};
 
   if (args.size() % 2 != 1) {
-    return (*cntx)->SendError(facade::WrongNumArgsError(cmd), kSyntaxErrType);
+    return cmd_cntx.rb->SendError(facade::WrongNumArgsError(cmd), kSyntaxErrType);
   }
 
   args.remove_prefix(1);
@@ -963,16 +1061,16 @@ void HSetFamily::HSet(CmdArgList args, ConnectionContext* cntx) {
     return OpSet(t->GetOpArgs(shard), key, args);
   };
 
-  OpResult<uint32_t> result = cntx->transaction->ScheduleSingleHopT(std::move(cb));
+  OpResult<uint32_t> result = cmd_cntx.tx->ScheduleSingleHopT(std::move(cb));
 
   if (result && cmd == "HSET") {
-    (*cntx)->SendLong(*result);
+    cmd_cntx.rb->SendLong(*result);
   } else {
-    (*cntx)->SendError(result.status());
+    cmd_cntx.rb->SendError(result.status());
   }
 }
 
-void HSetFamily::HSetNx(CmdArgList args, ConnectionContext* cntx) {
+void HSetFamily::HSetNx(CmdArgList args, const CommandContext& cmd_cntx) {
   string_view key = ArgS(args, 0);
 
   args.remove_prefix(1);
@@ -980,15 +1078,15 @@ void HSetFamily::HSetNx(CmdArgList args, ConnectionContext* cntx) {
     return OpSet(t->GetOpArgs(shard), key, args, OpSetParams{.skip_if_exists = true});
   };
 
-  OpResult<uint32_t> result = cntx->transaction->ScheduleSingleHopT(std::move(cb));
+  OpResult<uint32_t> result = cmd_cntx.tx->ScheduleSingleHopT(std::move(cb));
   if (result) {
-    (*cntx)->SendLong(*result);
+    cmd_cntx.rb->SendLong(*result);
   } else {
-    (*cntx)->SendError(result.status());
+    cmd_cntx.rb->SendError(result.status());
   }
 }
 
-void HSetFamily::HStrLen(CmdArgList args, ConnectionContext* cntx) {
+void HSetFamily::HStrLen(CmdArgList args, const CommandContext& cmd_cntx) {
   string_view key = ArgS(args, 0);
   string_view field = ArgS(args, 1);
 
@@ -996,21 +1094,48 @@ void HSetFamily::HStrLen(CmdArgList args, ConnectionContext* cntx) {
     return OpStrLen(t->GetOpArgs(shard), key, field);
   };
 
-  OpResult<size_t> result = cntx->transaction->ScheduleSingleHopT(std::move(cb));
+  OpResult<size_t> result = cmd_cntx.tx->ScheduleSingleHopT(std::move(cb));
   if (result) {
-    (*cntx)->SendLong(*result);
+    cmd_cntx.rb->SendLong(*result);
   } else {
-    (*cntx)->SendError(result.status());
+    cmd_cntx.rb->SendError(result.status());
   }
 }
 
-void HSetFamily::HRandField(CmdArgList args, ConnectionContext* cntx) {
+void StrVecEmplaceBack(StringVec& str_vec, const listpackEntry& lp) {
+  if (lp.sval) {
+    str_vec.emplace_back(reinterpret_cast<char*>(lp.sval), lp.slen);
+    return;
+  }
+  str_vec.emplace_back(absl::StrCat(lp.lval));
+}
+
+void HSetFamily::HRandField(CmdArgList args, const CommandContext& cmd_cntx) {
+  if (args.size() > 3) {
+    DVLOG(1) << "Wrong number of command arguments: " << args.size();
+    return cmd_cntx.rb->SendError(kSyntaxErr);
+  }
+
   string_view key = ArgS(args, 0);
+  int32_t count;
+  bool with_values = false;
+
+  if ((args.size() > 1) && (!SimpleAtoi(ArgS(args, 1), &count))) {
+    return cmd_cntx.rb->SendError("count value is not an integer", kSyntaxErrType);
+  }
+
+  if (args.size() == 3) {
+    string arg = absl::AsciiStrToUpper(ArgS(args, 2));
+    if (arg != "WITHVALUES")
+      return cmd_cntx.rb->SendError(kSyntaxErr);
+    else
+      with_values = true;
+  }
 
   auto cb = [&](Transaction* t, EngineShard* shard) -> OpResult<StringVec> {
-    auto& db_slice = shard->db_slice();
+    auto& db_slice = t->GetDbSlice(shard->shard_id());
     DbContext db_context = t->GetDbContext();
-    auto it_res = db_slice.Find(db_context, key, OBJ_HASH);
+    auto it_res = db_slice.FindReadOnly(db_context, key, OBJ_HASH);
 
     if (!it_res)
       return it_res.status();
@@ -1019,40 +1144,88 @@ void HSetFamily::HRandField(CmdArgList args, ConnectionContext* cntx) {
     StringVec str_vec;
 
     if (pv.Encoding() == kEncodingStrMap2) {
-      // TODO: to create real random logic.
-      StringMap* string_map = (StringMap*)pv.RObjPtr();
+      StringMap* string_map = GetStringMap(pv, db_context);
 
-      sds key = string_map->begin()->first;
-      str_vec.emplace_back(key, sdslen(key));
+      if (args.size() == 1) {
+        auto opt_pair = string_map->RandomPair();
+        if (opt_pair.has_value()) {
+          auto [key, value] = *opt_pair;
+          str_vec.emplace_back(key, sdslen(key));
+        }
+      } else {
+        size_t actual_count =
+            (count >= 0) ? std::min(size_t(count), string_map->UpperBoundSize()) : abs(count);
+        std::vector<sds> keys, vals;
+        if (count >= 0) {
+          string_map->RandomPairsUnique(actual_count, keys, vals, with_values);
+        } else {
+          string_map->RandomPairs(actual_count, keys, vals, with_values);
+        }
+        for (size_t i = 0; i < actual_count; ++i) {
+          str_vec.emplace_back(keys[i], sdslen(keys[i]));
+          if (with_values) {
+            str_vec.emplace_back(vals[i], sdslen(vals[i]));
+          }
+        }
+      }
+
+      if (string_map->Empty()) {  // Can happen if we use a TTL on hash members.
+        // post_updater will run immediately
+        auto it = db_slice.FindMutable(db_context, key).it;
+        db_slice.Del(db_context, it);
+        return facade::OpStatus::KEY_NOTFOUND;
+      }
     } else if (pv.Encoding() == kEncodingListPack) {
       uint8_t* lp = (uint8_t*)pv.RObjPtr();
       size_t lplen = lpLength(lp);
       CHECK(lplen > 0 && lplen % 2 == 0);
-
       size_t hlen = lplen / 2;
-      listpackEntry key;
-
-      lpRandomPair(lp, hlen, &key, NULL);
-      if (key.sval) {
-        str_vec.emplace_back(reinterpret_cast<char*>(key.sval), key.slen);
+      if (args.size() == 1) {
+        listpackEntry key;
+        lpRandomPair(lp, hlen, &key, NULL);
+        StrVecEmplaceBack(str_vec, key);
       } else {
-        str_vec.emplace_back(absl::StrCat(key.lval));
+        size_t actual_count = (count >= 0) ? std::min(size_t(count), hlen) : abs(count);
+        std::unique_ptr<listpackEntry[]> keys = nullptr, vals = nullptr;
+        keys = std::make_unique<listpackEntry[]>(actual_count);
+        if (with_values)
+          vals = std::make_unique<listpackEntry[]>(actual_count);
+
+        // count has been specified.
+        if (count >= 0)
+          // always returns unique entries.
+          lpRandomPairsUnique(lp, actual_count, keys.get(), vals.get());
+        else
+          // allows non-unique entries.
+          lpRandomPairs(lp, actual_count, keys.get(), vals.get());
+
+        for (size_t i = 0; i < actual_count; ++i) {
+          StrVecEmplaceBack(str_vec, keys[i]);
+          if (with_values) {
+            StrVecEmplaceBack(str_vec, vals[i]);
+          }
+        }
       }
     } else {
-      LOG(ERROR) << "Invalid encoding " << pv.Encoding();
-      return OpStatus::INVALID_VALUE;
+      LOG(FATAL) << "Invalid encoding " << pv.Encoding();
     }
     return str_vec;
   };
 
-  OpResult<StringVec> result = cntx->transaction->ScheduleSingleHopT(std::move(cb));
+  auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx.rb);
+  OpResult<StringVec> result = cmd_cntx.tx->ScheduleSingleHopT(std::move(cb));
   if (result) {
-    CHECK_EQ(1u, result->size());  // TBD: to support count and withvalues.
-    (*cntx)->SendBulkString(result->front());
+    if ((result->size() == 1) && (args.size() == 1))
+      rb->SendBulkString(result->front());
+    else
+      rb->SendBulkStrArr(*result, facade::RedisReplyBuilder::ARRAY);
   } else if (result.status() == OpStatus::KEY_NOTFOUND) {
-    (*cntx)->SendNull();
+    if (args.size() == 1)
+      rb->SendNull();
+    else
+      rb->SendEmptyArray();
   } else {
-    (*cntx)->SendError(result.status());
+    cmd_cntx.rb->SendError(result.status());
   }
 }
 
@@ -1060,35 +1233,53 @@ using CI = CommandId;
 
 #define HFUNC(x) SetHandler(&HSetFamily::x)
 
+namespace acl {
+constexpr uint32_t kHDel = WRITE | HASH | FAST;
+constexpr uint32_t kHLen = READ | HASH | FAST;
+constexpr uint32_t kHExists = READ | HASH | FAST;
+constexpr uint32_t kHGet = READ | HASH | FAST;
+constexpr uint32_t kHGetAll = READ | HASH | SLOW;
+constexpr uint32_t kHMGet = READ | HASH | FAST;
+constexpr uint32_t kHMSet = WRITE | HASH | FAST;
+constexpr uint32_t kHIncrBy = WRITE | HASH | FAST;
+constexpr uint32_t kHIncrByFloat = WRITE | HASH | FAST;
+constexpr uint32_t kHKeys = READ | HASH | SLOW;
+constexpr uint32_t kHRandField = READ | HASH | SLOW;
+constexpr uint32_t kHScan = READ | HASH | SLOW;
+constexpr uint32_t kHSet = WRITE | HASH | FAST;
+constexpr uint32_t kHSetEx = WRITE | HASH | FAST;
+constexpr uint32_t kHSetNx = WRITE | HASH | FAST;
+constexpr uint32_t kHStrLen = READ | HASH | FAST;
+constexpr uint32_t kHExpire = WRITE | HASH | FAST;
+constexpr uint32_t kHVals = READ | HASH | SLOW;
+}  // namespace acl
+
 void HSetFamily::Register(CommandRegistry* registry) {
-  *registry << CI{"HDEL", CO::FAST | CO::WRITE, -3, 1, 1, 1}.HFUNC(HDel)
-            << CI{"HLEN", CO::FAST | CO::READONLY, 2, 1, 1, 1}.HFUNC(HLen)
-            << CI{"HEXISTS", CO::FAST | CO::READONLY, 3, 1, 1, 1}.HFUNC(HExists)
-            << CI{"HGET", CO::FAST | CO::READONLY, 3, 1, 1, 1}.HFUNC(HGet)
-            << CI{"HGETALL", CO::FAST | CO::READONLY, 2, 1, 1, 1}.HFUNC(HGetAll)
-            << CI{"HMGET", CO::FAST | CO::READONLY, -3, 1, 1, 1}.HFUNC(HMGet)
-            << CI{"HMSET", CO::WRITE | CO::FAST | CO::DENYOOM, -4, 1, 1, 1}.HFUNC(HSet)
-            << CI{"HINCRBY", CO::WRITE | CO::DENYOOM | CO::FAST, 4, 1, 1, 1}.HFUNC(HIncrBy)
-            << CI{"HINCRBYFLOAT", CO::WRITE | CO::DENYOOM | CO::FAST, 4, 1, 1, 1}.HFUNC(
-                   HIncrByFloat)
-            << CI{"HKEYS", CO::READONLY, 2, 1, 1, 1}.HFUNC(HKeys)
-
-            // TODO: add options support
-            << CI{"HRANDFIELD", CO::READONLY, 2, 1, 1, 1}.HFUNC(HRandField)
-            << CI{"HSCAN", CO::READONLY, -3, 1, 1, 1}.HFUNC(HScan)
-            << CI{"HSET", CO::WRITE | CO::FAST | CO::DENYOOM, -4, 1, 1, 1}.HFUNC(HSet)
-            << CI{"HSETEX", CO::WRITE | CO::FAST | CO::DENYOOM, -5, 1, 1, 1}.SetHandler(HSetEx)
-            << CI{"HSETNX", CO::WRITE | CO::DENYOOM | CO::FAST, 4, 1, 1, 1}.HFUNC(HSetNx)
-            << CI{"HSTRLEN", CO::READONLY | CO::FAST, 3, 1, 1, 1}.HFUNC(HStrLen)
-            << CI{"HVALS", CO::READONLY, 2, 1, 1, 1}.HFUNC(HVals);
-}
-
-uint32_t HSetFamily::MaxListPackLen() {
-  return kMaxListPackLen;
+  registry->StartFamily();
+  *registry
+      << CI{"HDEL", CO::FAST | CO::WRITE, -3, 1, 1, acl::kHDel}.HFUNC(HDel)
+      << CI{"HLEN", CO::FAST | CO::READONLY, 2, 1, 1, acl::kHLen}.HFUNC(HLen)
+      << CI{"HEXISTS", CO::FAST | CO::READONLY, 3, 1, 1, acl::kHExists}.HFUNC(HExists)
+      << CI{"HGET", CO::FAST | CO::READONLY, 3, 1, 1, acl::kHGet}.HFUNC(HGet)
+      << CI{"HGETALL", CO::FAST | CO::READONLY, 2, 1, 1, acl::kHGetAll}.HFUNC(HGetAll)
+      << CI{"HMGET", CO::FAST | CO::READONLY, -3, 1, 1, acl::kHMGet}.HFUNC(HMGet)
+      << CI{"HMSET", CO::WRITE | CO::FAST | CO::DENYOOM, -4, 1, 1, acl::kHMSet}.HFUNC(HSet)
+      << CI{"HINCRBY", CO::WRITE | CO::DENYOOM | CO::FAST, 4, 1, 1, acl::kHIncrBy}.HFUNC(HIncrBy)
+      << CI{"HINCRBYFLOAT", CO::WRITE | CO::DENYOOM | CO::FAST, 4, 1, 1, acl::kHIncrByFloat}.HFUNC(
+             HIncrByFloat)
+      << CI{"HKEYS", CO::READONLY, 2, 1, 1, acl::kHKeys}.HFUNC(HKeys)
+      << CI{"HEXPIRE", CO::WRITE | CO::FAST | CO::DENYOOM, -5, 1, 1, acl::kHExpire}.HFUNC(HExpire)
+      << CI{"HRANDFIELD", CO::READONLY, -2, 1, 1, acl::kHRandField}.HFUNC(HRandField)
+      << CI{"HSCAN", CO::READONLY, -3, 1, 1, acl::kHScan}.HFUNC(HScan)
+      << CI{"HSET", CO::WRITE | CO::FAST | CO::DENYOOM, -4, 1, 1, acl::kHSet}.HFUNC(HSet)
+      << CI{"HSETEX", CO::WRITE | CO::FAST | CO::DENYOOM, -5, 1, 1, acl::kHSetEx}.SetHandler(HSetEx)
+      << CI{"HSETNX", CO::WRITE | CO::DENYOOM | CO::FAST, 4, 1, 1, acl::kHSetNx}.HFUNC(HSetNx)
+      << CI{"HSTRLEN", CO::READONLY | CO::FAST, 3, 1, 1, acl::kHStrLen}.HFUNC(HStrLen)
+      << CI{"HVALS", CO::READONLY, 2, 1, 1, acl::kHVals}.HFUNC(HVals);
 }
 
 StringMap* HSetFamily::ConvertToStrMap(uint8_t* lp) {
-  StringMap* sm = new StringMap(CompactObj::memory_resource());
+  StringMap* sm = CompactObj::AllocateMR<StringMap>();
   size_t lplen = lpLength(lp);
   if (lplen == 0)
     return sm;
@@ -1105,10 +1296,70 @@ StringMap* HSetFamily::ConvertToStrMap(uint8_t* lp) {
     lp_elem = lpNext(lp, lp_elem);  // switch to value
     DCHECK(lp_elem);
     string_view value = LpGetView(lp_elem, intbuf[1]);
-    lp_elem = lpNext(lp, lp_elem);       // switch to next key
-    CHECK(sm->AddOrUpdate(key, value));  // must be unique
+    lp_elem = lpNext(lp, lp_elem);  // switch to next key
+
+    // must be unique
+    if (!sm->AddOrUpdate(key, value)) {
+      uint8_t tmpbuf[LP_INTBUF_SIZE];
+
+      uint8_t* it = lpFirst(lp);
+      LOG(ERROR) << "Internal error while converting listpack to stringmap when inserting key: "
+                 << key << " , listpack keys are:";
+      do {
+        string_view key = LpGetView(it, tmpbuf);
+        LOG(ERROR) << "Listpack key: " << key;
+        it = lpNext(lp, it);
+        CHECK(it);  // value must exist
+        it = lpNext(lp, it);
+      } while (it);
+      LOG(ERROR) << "Internal error, report to Dragonfly team! ------------";
+    }
   } while (lp_elem);
 
   return sm;
 }
+
+// returns -1 if no expiry is associated with the field, -3 if no field is found.
+int32_t HSetFamily::FieldExpireTime(const DbContext& db_context, const PrimeValue& pv,
+                                    std::string_view field) {
+  DCHECK_EQ(OBJ_HASH, pv.ObjType());
+
+  if (pv.Encoding() == kEncodingListPack) {
+    uint8_t intbuf[LP_INTBUF_SIZE];
+    uint8_t* lp = (uint8_t*)pv.RObjPtr();
+    optional<string_view> res = LpFind(lp, field, intbuf);
+    return res ? -1 : -3;
+  } else {
+    StringMap* string_map = (StringMap*)pv.RObjPtr();
+    string_map->set_time(MemberTimeSeconds(db_context.time_now_ms));
+    auto it = string_map->Find(field);
+    if (it == string_map->end())
+      return -3;
+    return it.HasExpiry() ? it.ExpiryTime() : -1;
+  }
+}
+
+vector<long> HSetFamily::SetFieldsExpireTime(const OpArgs& op_args, uint32_t ttl_sec,
+                                             string_view key, CmdArgList values, PrimeValue* pv) {
+  DCHECK_EQ(OBJ_HASH, pv->ObjType());
+  op_args.shard->search_indices()->RemoveDoc(key, op_args.db_cntx, *pv);
+
+  if (pv->Encoding() == kEncodingListPack) {
+    // a valid result can never be a listpack, since it doesnt keep ttl
+    uint8_t* lp = (uint8_t*)pv->RObjPtr();
+    auto& db_slice = op_args.GetDbSlice();
+    DbTableStats* stats = db_slice.MutableStats(op_args.db_cntx.db_index);
+    stats->listpack_bytes -= lpBytes(lp);
+    stats->listpack_blob_cnt--;
+    StringMap* sm = HSetFamily::ConvertToStrMap(lp);
+    pv->InitRobj(OBJ_HASH, kEncodingStrMap2, sm);
+  }
+
+  // This needs to be explicitly fetched again since the pv might have changed.
+  StringMap* sm = container_utils::GetStringMap(*pv, op_args.db_cntx);
+  vector<long> res = ExpireElements(sm, values, ttl_sec);
+  op_args.shard->search_indices()->AddDoc(key, op_args.db_cntx, *pv);
+  return res;
+}
+
 }  // namespace dfly

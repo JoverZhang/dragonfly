@@ -6,23 +6,33 @@
 
 #include <absl/cleanup/cleanup.h>
 #include <absl/container/flat_hash_map.h>
+#include <absl/strings/escaping.h>
 #include <absl/strings/numbers.h>
 #include <absl/strings/str_split.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <mimalloc.h>
 
 #include <algorithm>
+#include <memory_resource>
 #include <random>
 
 #include "base/gtest.h"
 #include "base/logging.h"
 #include "core/search/base.h"
 #include "core/search/query_driver.h"
+#include "core/search/vector_utils.h"
+
+extern "C" {
+#include "redis/zmalloc.h"
+}
 
 namespace dfly {
 namespace search {
 
 using namespace std;
+
+using ::testing::HasSubstr;
 
 struct MockedDocument : public DocumentAccessor {
  public:
@@ -34,20 +44,40 @@ struct MockedDocument : public DocumentAccessor {
   MockedDocument(std::string test_field) : fields_{{"field", test_field}} {
   }
 
-  string_view GetString(string_view field) const override {
+  std::optional<StringList> GetStrings(string_view field) const override {
     auto it = fields_.find(field);
-    return it != fields_.end() ? string_view{it->second} : "";
+    if (it == fields_.end()) {
+      return EmptyAccessResult<StringList>();
+    }
+    return StringList{string_view{it->second}};
   }
 
-  FtVector GetVector(string_view field) const override {
-    string_view str_value = fields_.at(field);
-    FtVector out;
-    for (string_view coord : absl::StrSplit(str_value, ',')) {
-      float v;
-      CHECK(absl::SimpleAtof(coord, &v));
-      out.push_back(v);
+  std::optional<StringList> GetTags(string_view field) const override {
+    return GetStrings(field);
+  }
+
+  std::optional<VectorInfo> GetVector(string_view field) const override {
+    auto strings_list = GetStrings(field);
+    if (!strings_list)
+      return std::nullopt;
+    return !strings_list->empty() ? BytesToFtVectorSafe(strings_list->front()) : VectorInfo{};
+  }
+
+  std::optional<NumsList> GetNumbers(std::string_view field) const override {
+    auto strings_list = GetStrings(field);
+    if (!strings_list)
+      return std::nullopt;
+
+    NumsList nums_list;
+    nums_list.reserve(strings_list->size());
+    for (auto str : strings_list.value()) {
+      auto num = ParseNumericField(str);
+      if (!num) {
+        return std::nullopt;
+      }
+      nums_list.push_back(num.value());
     }
-    return out;
+    return nums_list;
   }
 
   string DebugFormat() {
@@ -68,22 +98,35 @@ struct MockedDocument : public DocumentAccessor {
   Map fields_{};
 };
 
-class SearchParserTest : public ::testing::Test {
+IndicesOptions kEmptyOptions{{}};
+
+Schema MakeSimpleSchema(initializer_list<pair<string_view, SchemaField::FieldType>> ilist) {
+  Schema schema;
+  for (auto [name, type] : ilist) {
+    schema.fields[name] = {type, 0, string{name}};
+    if (type == SchemaField::TAG)
+      schema.fields[name].special_params = SchemaField::TagParams{};
+  }
+  return schema;
+}
+
+class SearchTest : public ::testing::Test {
  protected:
-  SearchParserTest() {
-    PrepareSchema();
+  static void SetUpTestSuite() {
+    auto* tlh = mi_heap_get_backing();
+    init_zmalloc_threadlocal(tlh);
   }
 
-  ~SearchParserTest() {
+  SearchTest() {
+    PrepareSchema({{"field", SchemaField::TEXT}});
+  }
+
+  ~SearchTest() {
     EXPECT_EQ(entries_.size(), 0u) << "Missing check";
   }
 
-  void SetKnnVec(FtVector vec) {
-    params_.knn_vec = vec;
-  }
-
-  void PrepareSchema(Schema schema = {{{"field", Schema::TEXT}}}) {
-    schema_ = schema;
+  void PrepareSchema(initializer_list<pair<string_view, SchemaField::FieldType>> ilist) {
+    schema_ = MakeSimpleSchema(ilist);
   }
 
   void PrepareQuery(string_view query) {
@@ -101,14 +144,14 @@ class SearchParserTest : public ::testing::Test {
   bool Check() {
     absl::Cleanup cl{[this] { entries_.clear(); }};
 
-    FieldIndices index{schema_};
+    FieldIndices index{schema_, kEmptyOptions, PMR_NS::get_default_resource()};
 
     shuffle(entries_.begin(), entries_.end(), default_random_engine{});
     for (DocId i = 0; i < entries_.size(); i++)
-      index.Add(i, &entries_[i].first);
+      index.Add(i, entries_[i].first);
 
     SearchAlgorithm search_algo{};
-    if (!search_algo.Init(query_, params_)) {
+    if (!search_algo.Init(query_, &params_)) {
       error_ = "Failed to parse query";
       return false;
     }
@@ -143,7 +186,7 @@ class SearchParserTest : public ::testing::Test {
   string query_, error_;
 };
 
-TEST_F(SearchParserTest, MatchTerm) {
+TEST_F(SearchTest, MatchTerm) {
   PrepareQuery("foo");
 
   // Check basic cases
@@ -159,7 +202,7 @@ TEST_F(SearchParserTest, MatchTerm) {
   EXPECT_TRUE(Check()) << GetError();
 }
 
-TEST_F(SearchParserTest, MatchNotTerm) {
+TEST_F(SearchTest, MatchNotTerm) {
   PrepareQuery("-foo");
 
   ExpectAll("faa", "definitielyright");
@@ -168,7 +211,7 @@ TEST_F(SearchParserTest, MatchNotTerm) {
   EXPECT_TRUE(Check()) << GetError();
 }
 
-TEST_F(SearchParserTest, MatchLogicalNode) {
+TEST_F(SearchTest, MatchLogicalNode) {
   {
     PrepareQuery("foo bar");
 
@@ -197,7 +240,7 @@ TEST_F(SearchParserTest, MatchLogicalNode) {
   }
 }
 
-TEST_F(SearchParserTest, MatchParenthesis) {
+TEST_F(SearchTest, MatchParenthesis) {
   PrepareQuery("( foo | oof ) ( bar | rab )");
 
   ExpectAll("foo bar", "oof rab", "foo rab", "oof bar", "foo oof bar rab");
@@ -206,7 +249,7 @@ TEST_F(SearchParserTest, MatchParenthesis) {
   EXPECT_TRUE(Check()) << GetError();
 }
 
-TEST_F(SearchParserTest, CheckNotPriority) {
+TEST_F(SearchTest, CheckNotPriority) {
   for (auto expr : {"-bar foo baz", "foo -bar baz", "foo baz -bar"}) {
     PrepareQuery(expr);
 
@@ -224,9 +267,18 @@ TEST_F(SearchParserTest, CheckNotPriority) {
 
     EXPECT_TRUE(Check()) << GetError();
   }
+
+  for (auto expr : {"-bar far|-foo tam"}) {
+    PrepareQuery(expr);
+
+    ExpectAll("far baz", "far foo", "bar tam");
+    ExpectNone("bar far", "foo tam", "bar foo", "far bar foo");
+
+    EXPECT_TRUE(Check()) << GetError();
+  }
 }
 
-TEST_F(SearchParserTest, CheckParenthesisPriority) {
+TEST_F(SearchTest, CheckParenthesisPriority) {
   {
     PrepareQuery("foo | -(bar baz)");
 
@@ -245,10 +297,29 @@ TEST_F(SearchParserTest, CheckParenthesisPriority) {
   }
 }
 
+TEST_F(SearchTest, CheckPrefix) {
+  {
+    PrepareQuery("pre*");
+
+    ExpectAll("pre", "prepre", "preachers", "prepared", "pRetty", "PRedators", "prEcisely!");
+    ExpectNone("pristine", "represent", "repair", "depreciation");
+
+    EXPECT_TRUE(Check()) << GetError();
+  }
+  {
+    PrepareQuery("new*");
+
+    ExpectAll("new", "New York", "Newham", "newbie", "news", "Welcome to Newark!");
+    ExpectNone("ne", "renew", "nev", "ne-w", "notnew", "casino in neVada");
+
+    EXPECT_TRUE(Check()) << GetError();
+  }
+}
+
 using Map = MockedDocument::Map;
 
-TEST_F(SearchParserTest, MatchField) {
-  PrepareSchema({{{"f1", Schema::TEXT}, {"f2", Schema::TEXT}, {"f3", Schema::TEXT}}});
+TEST_F(SearchTest, MatchField) {
+  PrepareSchema({{"f1", SchemaField::TEXT}, {"f2", SchemaField::TEXT}, {"f3", SchemaField::TEXT}});
   PrepareQuery("@f1:foo @f2:bar @f3:baz");
 
   ExpectAll(Map{{"f1", "foo"}, {"f2", "bar"}, {"f3", "baz"}});
@@ -259,8 +330,8 @@ TEST_F(SearchParserTest, MatchField) {
   EXPECT_TRUE(Check()) << GetError();
 }
 
-TEST_F(SearchParserTest, MatchRange) {
-  PrepareSchema({{{"f1", Schema::NUMERIC}, {"f2", Schema::NUMERIC}}});
+TEST_F(SearchTest, MatchRange) {
+  PrepareSchema({{"f1", SchemaField::NUMERIC}, {"f2", SchemaField::NUMERIC}});
   PrepareQuery("@f1:[1 10] @f2:[50 100]");
 
   ExpectAll(Map{{"f1", "5"}, {"f2", "50"}}, Map{{"f1", "1"}, {"f2", "100"}},
@@ -270,14 +341,39 @@ TEST_F(SearchParserTest, MatchRange) {
   EXPECT_TRUE(Check()) << GetError();
 }
 
-TEST_F(SearchParserTest, MatchStar) {
+TEST_F(SearchTest, MatchDoubleRange) {
+  PrepareSchema({{"f1", SchemaField::NUMERIC}});
+
+  {
+    PrepareQuery("@f1: [100.03 199.97]");
+
+    ExpectAll(Map{{"f1", "130"}}, Map{{"f1", "170"}}, Map{{"f1", "100.03"}}, Map{{"f1", "199.97"}});
+
+    ExpectNone(Map{{"f1", "0"}}, Map{{"f1", "200"}}, Map{{"f1", "100.02999"}},
+               Map{{"f1", "199.9700001"}});
+
+    EXPECT_TRUE(Check()) << GetError();
+  }
+
+  {
+    PrepareQuery("@f1: [(100 (199.9]");
+
+    ExpectAll(Map{{"f1", "150"}}, Map{{"f1", "100.00001"}}, Map{{"f1", "199.8999999"}});
+
+    ExpectNone(Map{{"f1", "50"}}, Map{{"f1", "100"}}, Map{{"f1", "199.9"}}, Map{{"f1", "200"}});
+
+    EXPECT_TRUE(Check()) << GetError();
+  }
+}
+
+TEST_F(SearchTest, MatchStar) {
   PrepareQuery("*");
   ExpectAll("one", "two", "three", "and", "all", "documents");
   EXPECT_TRUE(Check()) << GetError();
 }
 
-TEST_F(SearchParserTest, CheckExprInField) {
-  PrepareSchema({{{"f1", Schema::TEXT}, {"f2", Schema::TEXT}, {"f3", Schema::TEXT}}});
+TEST_F(SearchTest, CheckExprInField) {
+  PrepareSchema({{"f1", SchemaField::TEXT}, {"f2", SchemaField::TEXT}, {"f3", SchemaField::TEXT}});
   {
     PrepareQuery("@f1:(a|b) @f2:(c d) @f3:-e");
 
@@ -297,10 +393,18 @@ TEST_F(SearchParserTest, CheckExprInField) {
 
     EXPECT_TRUE(Check()) << GetError();
   }
+  {
+    PrepareQuery("@f1:(-a c|-b d)");
+
+    ExpectAll(Map{{"f1", "c"}}, Map{{"f1", "d"}});
+    ExpectNone(Map{{"f1", "a"}}, Map{{"f1", "b"}});
+
+    EXPECT_TRUE(Check()) << GetError();
+  }
 }
 
-TEST_F(SearchParserTest, CheckTag) {
-  PrepareSchema({{{"f1", Schema::TAG}, {"f2", Schema::TAG}}});
+TEST_F(SearchTest, CheckTag) {
+  PrepareSchema({{"f1", SchemaField::TAG}, {"f2", SchemaField::TAG}});
 
   PrepareQuery("@f1:{red | blue} @f2:{circle | square}");
 
@@ -315,105 +419,351 @@ TEST_F(SearchParserTest, CheckTag) {
   EXPECT_TRUE(Check()) << GetError();
 }
 
-TEST_F(SearchParserTest, SimpleKnn) {
-  Schema schema{{{"even", Schema::TAG}, {"pos", Schema::VECTOR}}};
-  FieldIndices indices{schema};
+TEST_F(SearchTest, CheckTagPrefix) {
+  PrepareSchema({{"color", SchemaField::TAG}});
+  PrepareQuery("@color:{green* | orange | yellow*}");
+
+  ExpectAll(Map{{"color", "green"}}, Map{{"color", "yellow"}}, Map{{"color", "greenish"}},
+            Map{{"color", "yellowish"}}, Map{{"color", "green-forestish"}},
+            Map{{"color", "yellowsunish"}}, Map{{"color", "orange"}});
+  ExpectNone(Map{{"color", "red"}}, Map{{"color", "blue"}}, Map{{"color", "orangeish"}},
+             Map{{"color", "darkgreen"}}, Map{{"color", "light-yellow"}});
+
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(SearchTest, IntegerTerms) {
+  PrepareSchema({{"status", SchemaField::TAG}, {"title", SchemaField::TEXT}});
+
+  PrepareQuery("@status:{1} @title:33");
+
+  ExpectAll(Map{{"status", "1"}, {"title", "33 cars on the road"}});
+  ExpectNone(Map{{"status", "0"}, {"title", "22 trains on the tracks"}});
+
+  EXPECT_TRUE(Check()) << GetError();
+}
+
+TEST_F(SearchTest, StopWords) {
+  auto schema = MakeSimpleSchema({{"title", SchemaField::TEXT}});
+  IndicesOptions options{{"some", "words", "are", "left", "out"}};
+
+  FieldIndices indices{schema, options, PMR_NS::get_default_resource()};
+  SearchAlgorithm algo{};
+  QueryParams params;
+
+  vector<string> documents = {"some words left out",      //
+                              "some can be found",        //
+                              "words are never matched",  //
+                              "explicitly found!"};
+  for (size_t i = 0; i < documents.size(); i++) {
+    MockedDocument doc{{{"title", documents[i]}}};
+    indices.Add(i, doc);
+  }
+
+  // words is a stopword
+  algo.Init("words", &params);
+  EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre());
+
+  // some is a stopword
+  algo.Init("some", &params);
+  EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre());
+
+  // found is not a stopword
+  algo.Init("found", &params);
+  EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(1, 3));
+}
+
+std::string ToBytes(absl::Span<const float> vec) {
+  return string{reinterpret_cast<const char*>(vec.data()), sizeof(float) * vec.size()};
+}
+
+TEST_F(SearchTest, Errors) {
+  auto schema = MakeSimpleSchema(
+      {{"score", SchemaField::NUMERIC}, {"even", SchemaField::TAG}, {"pos", SchemaField::VECTOR}});
+  schema.fields["pos"].special_params = SchemaField::VectorParams{false, 1};
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource()};
+
+  SearchAlgorithm algo{};
+  QueryParams params;
+
+  // Non-existent field
+  algo.Init("@cantfindme:[1 10]", &params);
+  EXPECT_THAT(algo.Search(&indices).error, HasSubstr("Invalid field"));
+
+  // Invalid type
+  algo.Init("@even:[1 10]", &params);
+  EXPECT_THAT(algo.Search(&indices).error, HasSubstr("Wrong access type"));
+
+  // Wrong vector index dimensions
+  params["vec"] = ToBytes({1, 2, 3, 4});
+  algo.Init("* => [KNN 5 @pos $vec]", &params);
+  EXPECT_THAT(algo.Search(&indices).error, HasSubstr("Wrong vector index dimensions"));
+}
+
+class KnnTest : public SearchTest, public testing::WithParamInterface<bool /* hnsw */> {};
+
+TEST_P(KnnTest, Simple1D) {
+  auto schema = MakeSimpleSchema({{"even", SchemaField::TAG}, {"pos", SchemaField::VECTOR}});
+  schema.fields["pos"].special_params = SchemaField::VectorParams{GetParam(), 1};
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource()};
 
   // Place points on a straight line
   for (size_t i = 0; i < 100; i++) {
-    Map values{{{"even", i % 2 == 0 ? "YES" : "NO"}, {"pos", to_string(float(i))}}};
+    Map values{{{"even", i % 2 == 0 ? "YES" : "NO"}, {"pos", ToBytes({float(i)})}}};
     MockedDocument doc{values};
-    indices.Add(i, &doc);
+    indices.Add(i, doc);
   }
 
   SearchAlgorithm algo{};
+  QueryParams params;
 
   // Five closest to 50
   {
-    algo.Init("*=>[KNN 5 @pos VEC]", QueryParams{FtVector{50.0}});
+    params["vec"] = ToBytes({50.0});
+    algo.Init("*=>[KNN 5 @pos $vec]", &params);
     EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(48, 49, 50, 51, 52));
   }
 
   // Five closest to 0
   {
-    algo.Init("*=>[KNN 5 @pos VEC]", QueryParams{FtVector{0.0}});
+    params["vec"] = ToBytes({0.0});
+    algo.Init("*=>[KNN 5 @pos $vec]", &params);
     EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(0, 1, 2, 3, 4));
   }
 
   // Five closest to 20, all even
   {
-    algo.Init("@even:{yes} =>[KNN 5 @pos VEC]", QueryParams{FtVector{20.0}});
+    params["vec"] = ToBytes({20.0});
+    algo.Init("@even:{yes} =>[KNN 5 @pos $vec]", &params);
     EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(16, 18, 20, 22, 24));
   }
 
   // Three closest to 31, all odd
   {
-    algo.Init("@even:{no} =>[KNN 3 @pos VEC]", QueryParams{FtVector{31.0}});
+    params["vec"] = ToBytes({31.0});
+    algo.Init("@even:{no} =>[KNN 3 @pos $vec]", &params);
     EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(29, 31, 33));
   }
 
   // Two closest to 70.5
   {
-    algo.Init("* =>[KNN 2 @pos VEC]", QueryParams{FtVector{70.5}});
+    params["vec"] = ToBytes({70.5});
+    algo.Init("* =>[KNN 2 @pos $vec]", &params);
     EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(70, 71));
   }
 }
 
-TEST_F(SearchParserTest, Simple2dKnn) {
+TEST_P(KnnTest, Simple2D) {
   // Square:
   // 3      2
   //    4
   // 0      1
   const pair<float, float> kTestCoords[] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}, {0.5, 0.5}};
 
-  Schema schema{{{"pos", Schema::VECTOR}}};
-  FieldIndices indices{schema};
+  auto schema = MakeSimpleSchema({{"pos", SchemaField::VECTOR}});
+  schema.fields["pos"].special_params = SchemaField::VectorParams{GetParam(), 2};
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource()};
 
   for (size_t i = 0; i < ABSL_ARRAYSIZE(kTestCoords); i++) {
-    auto [x, y] = kTestCoords[i];
-    string coords = absl::StrCat(x, ",", y);
+    string coords = ToBytes({kTestCoords[i].first, kTestCoords[i].second});
     MockedDocument doc{Map{{"pos", coords}}};
-    indices.Add(i, &doc);
+    indices.Add(i, doc);
   }
 
   SearchAlgorithm algo{};
+  QueryParams params;
 
   // Single center
   {
-    algo.Init("* =>[KNN 1 @pos VEC]", QueryParams{FtVector{0.5, 0.5}});
+    params["vec"] = ToBytes({0.5, 0.5});
+    algo.Init("* =>[KNN 1 @pos $vec]", &params);
     EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(4));
   }
 
   // Lower left
   {
-    algo.Init("* =>[KNN 4 @pos VEC]", QueryParams{FtVector{0, 0}});
+    params["vec"] = ToBytes({0, 0});
+    algo.Init("* =>[KNN 4 @pos $vec]", &params);
     EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(0, 1, 3, 4));
   }
 
   // Upper right
   {
-    algo.Init("* =>[KNN 4 @pos VEC]", QueryParams{FtVector{1, 1}});
+    params["vec"] = ToBytes({1, 1});
+    algo.Init("* =>[KNN 4 @pos $vec]", &params);
     EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(1, 2, 3, 4));
   }
 
   // Request more than there is
   {
-    algo.Init("* => [KNN 10 @pos VEC]", QueryParams{FtVector{0, 0}});
+    params["vec"] = ToBytes({0, 0});
+    algo.Init("* => [KNN 10 @pos $vec]", &params);
     EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(0, 1, 2, 3, 4));
   }
 
   // Test correct order: (0.7, 0.15)
   {
-    algo.Init("* => [KNN 10 @pos VEC]", QueryParams{FtVector{0.7, 0.15}});
+    params["vec"] = ToBytes({0.7, 0.15});
+    algo.Init("* => [KNN 10 @pos $vec]", &params);
     EXPECT_THAT(algo.Search(&indices).ids, testing::ElementsAre(1, 4, 0, 2, 3));
   }
 
   // Test correct order: (0.8, 0.9)
   {
-    algo.Init("* => [KNN 10 @pos VEC]", QueryParams{FtVector{0.8, 0.9}});
+    params["vec"] = ToBytes({0.8, 0.9});
+    algo.Init("* => [KNN 10 @pos $vec]", &params);
     EXPECT_THAT(algo.Search(&indices).ids, testing::ElementsAre(2, 4, 3, 1, 0));
   }
 }
+
+TEST_P(KnnTest, Cosine) {
+  // Four arrows, closest cosing distance will be closes by angle
+  // 0 🡢 1 🡣 2 🡠 3 🡡
+  const pair<float, float> kTestCoords[] = {{1, 0}, {0, -1}, {-1, 0}, {0, 1}};
+
+  auto schema = MakeSimpleSchema({{"pos", SchemaField::VECTOR}});
+  schema.fields["pos"].special_params =
+      SchemaField::VectorParams{GetParam(), 2, VectorSimilarity::COSINE};
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource()};
+
+  for (size_t i = 0; i < ABSL_ARRAYSIZE(kTestCoords); i++) {
+    string coords = ToBytes({kTestCoords[i].first, kTestCoords[i].second});
+    MockedDocument doc{Map{{"pos", coords}}};
+    indices.Add(i, doc);
+  }
+
+  SearchAlgorithm algo{};
+  QueryParams params;
+
+  // Point down
+  {
+    params["vec"] = ToBytes({-0.1, -10});
+    algo.Init("* =>[KNN 1 @pos $vec]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(1));
+  }
+
+  // Point left
+  {
+    params["vec"] = ToBytes({-0.1, -0.01});
+    algo.Init("* =>[KNN 1 @pos $vec]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(2));
+  }
+
+  // Point up
+  {
+    params["vec"] = ToBytes({0, 5});
+    algo.Init("* =>[KNN 1 @pos $vec]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(3));
+  }
+
+  // Point right
+  {
+    params["vec"] = ToBytes({0.2, 0.05});
+    algo.Init("* =>[KNN 1 @pos $vec]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::UnorderedElementsAre(0));
+  }
+}
+
+TEST_P(KnnTest, AddRemove) {
+  auto schema = MakeSimpleSchema({{"pos", SchemaField::VECTOR}});
+  schema.fields["pos"].special_params =
+      SchemaField::VectorParams{GetParam(), 1, VectorSimilarity::L2};
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource()};
+
+  vector<MockedDocument> documents(10);
+  for (size_t i = 0; i < 10; i++) {
+    documents[i] = Map{{"pos", ToBytes({float(i)})}};
+    indices.Add(i, documents[i]);
+  }
+
+  SearchAlgorithm algo{};
+  QueryParams params;
+
+  // search leftmost 5
+  {
+    params["vec"] = ToBytes({-1.0});
+    algo.Init("* =>[KNN 5 @pos $vec]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::ElementsAre(0, 1, 2, 3, 4));
+  }
+
+  // delete leftmost 5
+  for (size_t i = 0; i < 5; i++)
+    indices.Remove(i, documents[i]);
+
+  // search leftmost 5 again
+  {
+    params["vec"] = ToBytes({-1.0});
+    algo.Init("* =>[KNN 5 @pos $vec]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::ElementsAre(5, 6, 7, 8, 9));
+  }
+
+  // add removed elements
+  for (size_t i = 0; i < 5; i++)
+    indices.Add(i, documents[i]);
+
+  // repeat first search
+  {
+    params["vec"] = ToBytes({-1.0});
+    algo.Init("* =>[KNN 5 @pos $vec]", &params);
+    EXPECT_THAT(algo.Search(&indices).ids, testing::ElementsAre(0, 1, 2, 3, 4));
+  }
+}
+
+TEST_P(KnnTest, AutoResize) {
+  // Make sure index resizes automatically even with a small initial capacity
+  const size_t kInitialCapacity = 5;
+
+  auto schema = MakeSimpleSchema({{"pos", SchemaField::VECTOR}});
+  schema.fields["pos"].special_params =
+      SchemaField::VectorParams{GetParam(), 1, VectorSimilarity::L2, kInitialCapacity};
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource()};
+
+  for (size_t i = 0; i < 100; i++) {
+    MockedDocument doc{Map{{"pos", ToBytes({float(i)})}}};
+    indices.Add(i, doc);
+  }
+
+  EXPECT_EQ(indices.GetAllDocs().size(), 100);
+}
+
+INSTANTIATE_TEST_SUITE_P(KnnFlat, KnnTest, testing::Values(false));
+INSTANTIATE_TEST_SUITE_P(KnnHnsw, KnnTest, testing::Values(true));
+
+static void BM_VectorSearch(benchmark::State& state) {
+  unsigned ndims = state.range(0);
+  unsigned nvecs = state.range(1);
+
+  auto schema = MakeSimpleSchema({{"pos", SchemaField::VECTOR}});
+  schema.fields["pos"].special_params = SchemaField::VectorParams{false, ndims};
+  FieldIndices indices{schema, kEmptyOptions, PMR_NS::get_default_resource()};
+
+  auto random_vec = [ndims]() {
+    vector<float> coords;
+    for (size_t j = 0; j < ndims; j++)
+      coords.push_back(static_cast<float>(rand()) / static_cast<float>(RAND_MAX));
+    return coords;
+  };
+
+  for (size_t i = 0; i < nvecs; i++) {
+    auto rv = random_vec();
+    MockedDocument doc{Map{{"pos", ToBytes(rv)}}};
+    indices.Add(i, doc);
+  }
+
+  SearchAlgorithm algo{};
+  QueryParams params;
+
+  auto rv = random_vec();
+  params["vec"] = ToBytes(rv);
+  algo.Init("* =>[KNN 1 @pos $vec]", &params);
+
+  while (state.KeepRunningBatch(10)) {
+    for (size_t i = 0; i < 10; i++)
+      benchmark::DoNotOptimize(algo.Search(&indices));
+  }
+}
+
+BENCHMARK(BM_VectorSearch)->Args({120, 10'000});
 
 }  // namespace search
 

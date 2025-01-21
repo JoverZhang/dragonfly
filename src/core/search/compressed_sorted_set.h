@@ -7,6 +7,8 @@
 #include <optional>
 #include <vector>
 
+#include "base/logging.h"
+#include "base/pmr/memory_resource.h"
 #include "core/search/base.h"
 
 namespace dfly::search {
@@ -47,42 +49,25 @@ class CompressedSortedSet {
     absl::Span<const uint8_t> diffs_{};
   };
 
-  // Output iterator to build compressed list from sorted range
-  struct SortedBackInserter {
-    using iterator_category = std::forward_iterator_tag;
-    using difference_type = std::ptrdiff_t;
-    using value_type = IntType;
-    using pointer = IntType*;
-    using reference = IntType&;
-
-    explicit SortedBackInserter(CompressedSortedSet* list);
-
-    SortedBackInserter& operator*() {
-      return *this;
-    }
-    SortedBackInserter& operator++() {
-      return *this;
-    }
-
-    SortedBackInserter& operator=(IntType value);
-
-   private:
-    IntType last_;
-    CompressedSortedSet* list_;
-  };
-
-  friend struct Iterator;
-  friend struct SortedBackInserter;
+  using iterator = ConstIterator;
 
  public:
+  explicit CompressedSortedSet(PMR_NS::memory_resource* mr);
+
   ConstIterator begin() const;
   ConstIterator end() const;
 
-  void Insert(IntType value);  // Insert arbitrary element, needs to scan whole list
-  void Remove(IntType value);  // Remove arbitrary element, needs to scan whole list
+  bool Insert(IntType value);  // Insert arbitrary element, needs to scan whole list
+  bool Remove(IntType value);  // Remove arbitrary element, needs to scan whole list
 
   size_t Size() const;
   size_t ByteSize() const;
+
+  // Add all values from other
+  void Merge(CompressedSortedSet&& other);
+
+  // Split into two equally sized halves
+  std::pair<CompressedSortedSet, CompressedSortedSet> Split() &&;
 
  private:
   struct EntryLocation {
@@ -106,8 +91,10 @@ class CompressedSortedSet {
   static std::pair<IntType /*value*/, size_t /*read*/> ReadVarLen(absl::Span<const uint8_t> source);
 
  private:
-  IntType size_{0};
-  std::vector<uint8_t> diffs_{};
+  uint32_t size_{0};
+
+  std::optional<IntType> tail_value_{};
+  std::vector<uint8_t, PMR_NS::polymorphic_allocator<uint8_t>> diffs_;
 };
 
 }  // namespace dfly::search

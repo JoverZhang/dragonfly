@@ -36,8 +36,8 @@ jobs:
       run: |
         # If env.IS_PRERELEASE is true, set tag to alpha and do not enable tag_latest
         # If env.IS_PRERELEASE is not true (aka false), don't set an extra tag and enable tag_latest
-        echo "::set-output name=tag::${{ env.IS_PRERELEASE == 'true' && 'alpha' }}"
-        echo "::set-output name=tag_latest::${{ env.IS_PRERELEASE == 'true' && 'false' || 'true' }}"
+        echo "tag=${{ env.IS_PRERELEASE == 'true' && 'alpha' }}" >> $GITHUB_OUTPUT
+        echo "tag_latest=${{ env.IS_PRERELEASE == 'true' && 'false' || 'true' }}" >> $GITHUB_OUTPUT
 
   release-container:
     needs: release-container-prereq
@@ -63,15 +63,15 @@ jobs:
       run: env
 
     - name: checkout
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
       with:
         fetch-depth: 0
 
     - name: Install helm
-      uses: azure/setup-helm@v3
+      uses: azure/setup-helm@v4
 
     - name: Setup Go
-      uses: actions/setup-go@v3
+      uses: actions/setup-go@v5
 
     - name: Configure Git
       if: env.IS_PRERELEASE != 'true'
@@ -93,7 +93,7 @@ jobs:
         git commit \
           -m 'chore(helm-chart): update to ${{ env.TAG_NAME }}' \
           contrib/charts/dragonfly/Chart.yaml \
-          contrib/charts/dragonfly/ci
+          contrib/charts/dragonfly/ci || true
 
     - name: Push Helm chart as OCI to Github
       if: env.IS_PRERELEASE != 'true'

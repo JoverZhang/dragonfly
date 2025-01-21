@@ -7,8 +7,8 @@
 #include <optional>
 #include <string>
 
-#include "base/io_buf.h"
 #include "io/io.h"
+#include "io/io_buf.h"
 #include "server/common.h"
 #include "server/journal/types.h"
 
@@ -22,15 +22,11 @@ class JournalWriter {
 
   // Write single entry to sink.
   void Write(const journal::Entry& entry);
+  void Write(uint64_t v);  // Write packed unsigned integer.
 
  private:
-  void Write(uint64_t v);           // Write packed unsigned integer.
   void Write(std::string_view sv);  // Write string.
-
-  template <typename C>  // CmdArgList or ArgSlice.
-  void Write(std::pair<std::string_view, C> args);
-
-  void Write(std::monostate);  // Overload for empty std::variant
+  void Write(const journal::Entry::Payload& payload);
 
  private:
   io::Sink* sink_;
@@ -58,7 +54,7 @@ struct JournalReader {
   template <typename UT> io::Result<UT> ReadUInt();
 
   // Read and copy to buffer, return size.
-  io::Result<size_t> ReadString(MutableSlice buffer);
+  io::Result<size_t> ReadString(io::MutableBytes buffer);
 
   // Read argument array into string buffer.
   std::error_code ReadCommand(journal::ParsedEntry::CmdData* entry);

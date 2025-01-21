@@ -8,9 +8,14 @@ clang-*
 third_party
 genfiles/*
 *.sublime-*
+*.orig
 .tags
 !third_party/include/*
 *.pyc
 /CMakeLists.txt.user
 _deps
 releases
+.DS_Store
+.idea/*
+.hypothesis
+.secrets
