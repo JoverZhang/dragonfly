@@ -4,92 +4,68 @@
 
 #pragma once
 
-#include <absl/base/thread_annotations.h>
-#include <absl/container/flat_hash_set.h>
-
-#include <array>
-#include <bitset>
 #include <memory>
 #include <string_view>
 #include <vector>
 
-#include "core/json_object.h"
-#include "src/core/fibers.h"
+#include "src/server/cluster/slot_set.h"
 
-namespace dfly {
-
-using SlotId = uint16_t;
-using SlotSet = absl::flat_hash_set<SlotId>;
+namespace dfly::cluster {
 
 class ClusterConfig {
  public:
-  static constexpr SlotId kMaxSlotNum = 0x3FFF;
-
-  struct Node {
-    std::string id;
-    std::string ip;
-    uint16_t port = 0;
-  };
-
-  struct SlotRange {
-    SlotId start = 0;
-    SlotId end = 0;
-  };
-
-  struct ClusterShard {
-    std::vector<SlotRange> slot_ranges;
-    Node master;
-    std::vector<Node> replicas;
-  };
-
-  using ClusterShards = std::vector<ClusterShard>;
-
-  static SlotId KeySlot(std::string_view key);
-
-  static void EnableCluster() {
-    cluster_enabled = true;
-  }
-
-  static bool IsClusterEnabled() {
-    return cluster_enabled;
-  }
-
-  // If the key contains the {...} pattern, return only the part between { and }
-  static std::string_view KeyTag(std::string_view key);
-
   // Returns an instance with `config` if it is valid.
   // Returns heap-allocated object as it is too big for a stack frame.
   static std::shared_ptr<ClusterConfig> CreateFromConfig(std::string_view my_id,
-                                                         const ClusterShards& config);
+                                                         const ClusterShardInfos& config);
 
-  // Parses `json_config` into `ClusterShards` and calls the above overload.
+  // Parses `json_config` into `ClusterShardInfos` and calls the above overload.
   static std::shared_ptr<ClusterConfig> CreateFromConfig(std::string_view my_id,
-                                                         const JsonType& json_config);
+                                                         std::string_view json_config);
+
+  std::shared_ptr<ClusterConfig> CloneWithChanges(const SlotRanges& enable_slots,
+                                                  const SlotRanges& disable_slots) const;
+
+  std::shared_ptr<ClusterConfig> CloneWithoutMigrations() const;
 
   // If key is in my slots ownership return true
   bool IsMySlot(SlotId id) const;
+  bool IsMySlot(std::string_view key) const;
 
   // Returns the master configured for `id`.
-  Node GetMasterNodeForSlot(SlotId id) const;
+  ClusterNodeInfo GetMasterNodeForSlot(SlotId id) const;
 
-  ClusterShards GetConfig() const;
+  ClusterShardInfos GetConfig() const;
 
-  SlotSet GetOwnedSlots() const;
+  const SlotSet& GetOwnedSlots() const;
+
+  std::vector<MigrationInfo> GetNewOutgoingMigrations(
+      const std::shared_ptr<ClusterConfig>& prev) const;
+  std::vector<MigrationInfo> GetNewIncomingMigrations(
+      const std::shared_ptr<ClusterConfig>& prev) const;
+  std::vector<MigrationInfo> GetFinishedOutgoingMigrations(
+      const std::shared_ptr<ClusterConfig>& prev) const;
+  std::vector<MigrationInfo> GetFinishedIncomingMigrations(
+      const std::shared_ptr<ClusterConfig>& prev) const;
+
+  std::vector<MigrationInfo> GetIncomingMigrations() const {
+    return my_incoming_migrations_;
+  }
 
  private:
   struct SlotEntry {
-    const ClusterShard* shard = nullptr;
+    const ClusterShardInfo* shard = nullptr;
     bool owned_by_me = false;
   };
 
-  static bool cluster_enabled;
-
   ClusterConfig() = default;
 
-  ClusterShards config_;
+  std::string my_id_;
+  ClusterShardInfos config_;
 
-  // True bits in `my_slots_` indicate that this slot is owned by this node.
-  std::bitset<kMaxSlotNum + 1> my_slots_;
+  SlotSet my_slots_;
+  std::vector<MigrationInfo> my_outgoing_migrations_;
+  std::vector<MigrationInfo> my_incoming_migrations_;
 };
 
-}  // namespace dfly
+}  // namespace dfly::cluster

@@ -75,6 +75,76 @@ TEST_F(GenericFamilyTest, Expire) {
   EXPECT_THAT(resp, ArgType(RespExpr::NIL));
 }
 
+TEST_F(GenericFamilyTest, ExpireOptions) {
+  // NX and XX are mutually exclusive
+  Run({"set", "key", "val"});
+  auto resp = Run({"expire", "key", "3600", "NX", "XX"});
+  ASSERT_THAT(resp, ErrArg("NX and XX, GT or LT options at the same time are not compatible"));
+
+  // NX and GT are mutually exclusive
+  resp = Run({"expire", "key", "3600", "NX", "GT"});
+  ASSERT_THAT(resp, ErrArg("NX and XX, GT or LT options at the same time are not compatible"));
+
+  // NX and LT are mutually exclusive
+  resp = Run({"expire", "key", "3600", "NX", "LT"});
+  ASSERT_THAT(resp, ErrArg("NX and XX, GT or LT options at the same time are not compatible"));
+
+  // GT and LT are mutually exclusive
+  resp = Run({"expire", "key", "3600", "GT", "LT"});
+  ASSERT_THAT(resp, ErrArg("GT and LT options at the same time are not compatible"));
+
+  // NX option should be added since there is no expiry
+  resp = Run({"expire", "key", "3600", "NX"});
+  EXPECT_THAT(resp, IntArg(1));
+  resp = Run({"ttl", "key"});
+  EXPECT_THAT(resp.GetInt(), 3600);
+
+  // running again with NX option, should not change expiry
+  resp = Run({"expire", "key", "42", "NX"});
+  EXPECT_THAT(resp, IntArg(0));
+
+  // given a key with no expiry
+  Run({"set", "key2", "val"});
+  resp = Run({"expire", "key2", "404", "XX"});
+  // XX does not apply expiry since key has no existing expiry
+  EXPECT_THAT(resp, IntArg(0));
+  resp = Run({"ttl", "key2"});
+  EXPECT_THAT(resp.GetInt(), -1);
+
+  // set expiry to 101
+  resp = Run({"expire", "key", "101"});
+  EXPECT_THAT(resp, IntArg(1));
+
+  // GT should not apply expiry since new is not greater than the current one
+  resp = Run({"expire", "key", "100", "GT"});
+  EXPECT_THAT(resp, IntArg(0));
+  resp = Run({"ttl", "key"});
+  EXPECT_THAT(resp.GetInt(), 101);
+
+  // GT should apply expiry since new is greater than the current one
+  resp = Run({"expire", "key", "102", "GT"});
+  EXPECT_THAT(resp, IntArg(1));
+  resp = Run({"ttl", "key"});
+  EXPECT_THAT(resp.GetInt(), 102);
+
+  // GT should not apply since expiry is smaller than current
+  resp = Run({"expire", "key", "101", "GT"});
+  EXPECT_THAT(resp, IntArg(0));
+  resp = Run({"ttl", "key"});
+  EXPECT_THAT(resp.GetInt(), 102);
+
+  // LT should apply new expiry is smaller than current
+  resp = Run({"expire", "key", "101", "LT"});
+  EXPECT_THAT(resp, IntArg(1));
+  resp = Run({"ttl", "key"});
+  EXPECT_THAT(resp.GetInt(), 101);
+
+  resp = Run({"expire", "key", "102", "LT"});
+  EXPECT_THAT(resp, IntArg(0));
+  resp = Run({"ttl", "key"});
+  EXPECT_THAT(resp.GetInt(), 101);
+}
+
 TEST_F(GenericFamilyTest, Del) {
   for (size_t i = 0; i < 1000; ++i) {
     Run({"set", StrCat("foo", i), "1"});
@@ -201,6 +271,7 @@ TEST_F(GenericFamilyTest, RenameNx) {
   ASSERT_THAT(Run({"renamenx", "x", "b"}), IntArg(0));  // b already exists
   ASSERT_THAT(Run({"renamenx", "x", "y"}), IntArg(1));
   ASSERT_EQ(Run({"get", "y"}), x_val);
+  ASSERT_THAT(Run({"renamenx", "y", "y"}), IntArg(0));
 }
 
 TEST_F(GenericFamilyTest, RenameSameName) {
@@ -210,6 +281,15 @@ TEST_F(GenericFamilyTest, RenameSameName) {
 
   ASSERT_EQ(Run({"set", kKey, "value"}), "OK");
   EXPECT_EQ(Run({"rename", kKey, kKey}), "OK");
+}
+
+TEST_F(GenericFamilyTest, RenameSameShard) {
+  num_threads_ = 1;
+  ResetService();
+
+  ASSERT_EQ(Run({"set", "x", "value"}), "OK");
+  ASSERT_EQ(Run({"set", "y", "value"}), "OK");
+  EXPECT_EQ(Run({"rename", "x", "y"}), "OK");
 }
 
 TEST_F(GenericFamilyTest, Stick) {
@@ -321,6 +401,15 @@ TEST_F(GenericFamilyTest, Scan) {
   vec = StrArray(resp.GetVec()[1]);
   EXPECT_EQ(10, vec.size());
   EXPECT_THAT(vec, Each(StartsWith("zset")));
+
+  Run({"flushdb"});
+
+  Run({"set", "", "foo"});
+  Run({"set", "bar", "1"});
+  resp = Run({"keys", "*"});
+  EXPECT_THAT(resp, RespArray(ElementsAre("bar", "")));
+  resp = Run({"keys", ""});
+  EXPECT_EQ(resp, "");
 }
 
 TEST_F(GenericFamilyTest, Sort) {
@@ -386,9 +475,32 @@ TEST_F(GenericFamilyTest, Sort) {
   // Test not convertible to double
   Run({"lpush", "list-2", "NOTADOUBLE"});
   ASSERT_THAT(Run({"sort", "list-2"}), ErrArg("One or more scores can't be converted into double"));
+
+  Run({"set", "foo", "bar"});
+  ASSERT_THAT(Run({"sort", "foo"}), ErrArg("WRONGTYPE "));
+
+  Run({"rpush", "list-3", ""});
+  ASSERT_THAT(Run({"sort", "list-3"}), "");
+
+  Run({"rpush", "list-3", "2", "0", "", "-0.14", "0.12", "-0", "-123123", "7654"});
+  ASSERT_THAT(Run({"sort", "list-3"}).GetVec(),
+              ElementsAre("-123123", "-0.14", "", "", "-0", "0", "0.12", "2", "7654"));
+
+  Run({"rpush", "NANvalue", "nan"});
+  ASSERT_THAT(Run({"sort", "NANvalue"}),
+              ErrArg("One or more scores can't be converted into double"));
 }
 
-TEST_F(GenericFamilyTest, Time) {
+TEST_F(GenericFamilyTest, SortBug3636) {
+  Run({"RPUSH", "foo", "1.100000023841858", "1.100000023841858", "1.100000023841858", "-15710",
+       "1.100000023841858", "1.100000023841858", "1.100000023841858", "-15710", "-15710",
+       "1.100000023841858", "-15710", "-15710", "-15710", "-15710", "1.100000023841858", "-15710",
+       "-15710"});
+  auto resp = Run({"SORT", "foo", "desc", "alpha"});
+  ASSERT_THAT(resp, ArrLen(17));
+}
+
+TEST_F(GenericFamilyTest, TimeNoKeys) {
   auto resp = Run({"time"});
   EXPECT_THAT(resp, ArrLen(2));
   EXPECT_THAT(resp.GetVec()[0], ArgType(RespExpr::INT64));
@@ -400,10 +512,33 @@ TEST_F(GenericFamilyTest, Time) {
   usleep(2000);
   Run({"time"});
   resp = Run({"exec"});
-  EXPECT_THAT(resp, ArrLen(2));
 
-  ASSERT_THAT(resp.GetVec()[0], ArrLen(2));
-  ASSERT_THAT(resp.GetVec()[1], ArrLen(2));
+  EXPECT_THAT(resp, RespArray(ElementsAre(RespArray(ElementsAre(Not(IntArg(0)), _)),
+                                          RespArray(ElementsAre(Not(IntArg(0)), _)))));
+
+  for (int i = 0; i < 2; ++i) {
+    int64_t val0 = get<int64_t>(resp.GetVec()[0].GetVec()[i].u);
+    int64_t val1 = get<int64_t>(resp.GetVec()[1].GetVec()[i].u);
+    EXPECT_EQ(val0, val1);
+  }
+}
+
+TEST_F(GenericFamilyTest, TimeWithKeys) {
+  auto resp = Run({"time"});
+  EXPECT_THAT(resp, ArrLen(2));
+  EXPECT_THAT(resp.GetVec()[0], ArgType(RespExpr::INT64));
+  EXPECT_THAT(resp.GetVec()[1], ArgType(RespExpr::INT64));
+
+  // Check that time is the same inside a transaction.
+  Run({"multi"});
+  Run({"time"});
+  usleep(2000);
+  Run({"time"});
+  Run({"get", "x"});
+  resp = Run({"exec"});
+
+  EXPECT_THAT(resp, RespArray(ElementsAre(RespArray(ElementsAre(Not(IntArg(0)), _)),
+                                          RespArray(ElementsAre(Not(IntArg(0)), _)), _)));
 
   for (int i = 0; i < 2; ++i) {
     int64_t val0 = get<int64_t>(resp.GetVec()[0].GetVec()[i].u);
@@ -428,18 +563,16 @@ TEST_F(GenericFamilyTest, Persist) {
 }
 
 TEST_F(GenericFamilyTest, Dump) {
-  // The following would only work for RDB version 9
-  // The format was changed at version 10
-  // The expected results were taken from running the same with Redis branch 6.2
-  ASSERT_THAT(RDB_VERSION, 9);
+  ASSERT_EQ(RDB_SER_VERSION, 9);
   uint8_t EXPECTED_STRING_DUMP[13] = {0x00, 0xc0, 0x13, 0x09, 0x00, 0x23, 0x13,
                                       0x6f, 0x4d, 0x68, 0xf6, 0x35, 0x6e};
   uint8_t EXPECTED_HASH_DUMP[] = {0x0d, 0x12, 0x12, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x00,
                                   0x02, 0x00, 0x00, 0xfe, 0x13, 0x03, 0xc0, 0xd2, 0x04, 0xff,
                                   0x09, 0x00, 0xb1, 0x0b, 0xae, 0x6c, 0x23, 0x5d, 0x17, 0xaa};
-  uint8_t EXPECTED_LIST_DUMP[] = {0x0e, 0x01, 0x0e, 0x0e, 0x00, 0x00, 0x00, 0x0a, 0x00,
-                                  0x00, 0x00, 0x01, 0x00, 0x00, 0xfe, 0x14, 0xff, 0x09,
-                                  0x00, 0xba, 0x1e, 0xa9, 0x6b, 0xba, 0xfe, 0x2d, 0x3f};
+
+  uint8_t EXPECTED_LIST_DUMP[] = {0x12, 0x01, 0x02, '\t', '\t', 0x00, 0x00, 0x00,
+                                  0x01, 0x00, 0x14, 0x01, 0xff, '\t', 0x00, 0xfb,
+                                  0xbd, 0x36, 0xf8, 0xb4, 't',  '%',  ';'};
 
   // Check string dump
   auto resp = Run({"set", "z", "19"});
@@ -452,7 +585,7 @@ TEST_F(GenericFamilyTest, Dump) {
   EXPECT_EQ(1, CheckedInt({"rpush", "l", "20"}));
   resp = Run({"dump", "l"});
   dump = resp.GetBuf();
-  CHECK_EQ(ToSV(dump), ToSV(EXPECTED_LIST_DUMP));
+  CHECK_EQ(ToSV(dump), ToSV(EXPECTED_LIST_DUMP)) << absl::CHexEscape(resp.GetString());
 
   // Check for hash dump
   EXPECT_EQ(1, CheckedInt({"hset", "z2", "19", "1234"}));
@@ -471,16 +604,17 @@ TEST_F(GenericFamilyTest, Restore) {
   using std::chrono::seconds;
   using std::chrono::system_clock;
 
+  // redis 6 with RDB_VERSION 9
   uint8_t STRING_DUMP_REDIS[] = {0x00, 0xc1, 0xd2, 0x04, 0x09, 0x00, 0xd0,
                                  0x75, 0x59, 0x6d, 0x10, 0x04, 0x3f, 0x5c};
-
   auto resp = Run({"set", "exiting-key", "1234"});
   EXPECT_EQ(resp, "OK");
-  // try to restore into existing key - this should failed
-  ASSERT_THAT(Run({"restore", "exiting-key", "0", ToSV(STRING_DUMP_REDIS)}),
-              ArgType(RespExpr::ERROR));
 
-  // Try restore while setting expiration into the pass
+  // try to restore into existing key - this should fail. We should get BUSYKEY error
+  ASSERT_THAT(Run({"restore", "exiting-key", "0", ToSV(STRING_DUMP_REDIS)}),
+              ErrArg("BUSYKEY Target key name already exists."));
+
+  // Try restore while setting expiration into the past
   // note that value for expiration is just some valid unix time stamp from the pass
   resp = Run(
       {"restore", "exiting-key", "1665476212900", ToSV(STRING_DUMP_REDIS), "ABSTTL", "REPLACE"});
@@ -520,11 +654,11 @@ TEST_F(GenericFamilyTest, Restore) {
   resp = Run({"dump", "string-key"});
   dump = resp.GetBuf();
   // this will change the value from "hello world" to "1234"
-  resp = Run({"restore", "string-key", "7", ToSV(STRING_DUMP_REDIS), "REPLACE"});
+  resp = Run({"restore", "string-key", "7000", ToSV(STRING_DUMP_REDIS), "REPLACE"});
   resp = Run({"get", "string-key"});
   EXPECT_EQ("1234", resp);
   // check TTL validity
-  EXPECT_EQ(CheckedInt({"ttl", "string-key"}), 7);
+  EXPECT_EQ(CheckedInt({"pttl", "string-key"}), 7000);
 
   // Make check about ttl with abs time, restoring back to "hello world"
   resp = Run({"restore", "string-key", absl::StrCat(TEST_current_time_ms + 2000), ToSV(dump),
@@ -538,46 +672,224 @@ TEST_F(GenericFamilyTest, Restore) {
   resp = Run({"get", "string-key"});
   EXPECT_EQ("1234", resp);
   EXPECT_EQ(CheckedInt({"ttl", "string-key"}), -1);
+
+  // The following set was created in Redis 7 with rdb version 11 and it's listpack encoded.
+  // We should be able to read it and convert it to our own format DenseSet or HT
+  // sadd myset "acme"
+  // dump myset
+  uint8_t SET_LISTPACK_DUMP[] = {0x14, 0x0D, 0x0D, 0x00, 0x00, 0x00, 0x01, 0x00, 0x84,
+                                 0x61, 0x63, 0x6D, 0x65, 0x05, 0xff, 0x0b, 0x00, 0xc1,
+                                 0x37, 0x5c, 0xe5, 0xe2, 0xc0, 0xdd, 0x27};
+  resp = Run({"restore", "listpack-set", "0", ToSV(SET_LISTPACK_DUMP)});
+  resp = Run({"sismember", "listpack-set", "acme"});
+  EXPECT_EQ(true, resp.GetInt().has_value());
+  EXPECT_EQ(1, resp.GetInt());
+
+  // The following zset was created in Redis 7 with rdb version 11 and it's listpack encoded.
+  // zadd my-zset 1 "elon"
+  // dump my-zset
+  uint8_t ZSET_LISTPACK_DUMP[] = {0x11, 0x0f, 0x0f, 0x00, 0x00, 0x00, 0x02, 0x00, 0x84,
+                                  0x65, 0x6c, 0x6f, 0x6e, 0x05, 0x01, 0x01, 0xff, 0x0b,
+                                  0x00, 0xc8, 0x01, 0x2c, 0xad, 0xd9, 0xa3, 0x99, 0x5e};
+
+  resp = Run({"restore", "my-zset", "0", ToSV(ZSET_LISTPACK_DUMP)});
+  EXPECT_EQ(resp.GetString(), "OK");
+  resp = Run({"zrange", "my-zset", "0", "-1"});
+  EXPECT_EQ("elon", resp.GetString());
+
+  // corrupt the dump file but keep the crc correct.
+  ZSET_LISTPACK_DUMP[0] = 0x12;
+  uint8_t crc64[8] = {0x4e, 0xa3, 0x4c, 0x89, 0xc4, 0x8b, 0xd9, 0xe4};
+  memcpy(ZSET_LISTPACK_DUMP + 19, crc64, 8);
+  resp = Run({"restore", "invalid", "0", ToSV(ZSET_LISTPACK_DUMP)});
+  EXPECT_THAT(resp, ErrArg("ERR Bad data format"));
 }
 
 TEST_F(GenericFamilyTest, Info) {
+  InitWithDbFilename();  // Needed for `save`
+
   auto get_rdb_changes_since_last_save = [](const string& str) -> size_t {
-    const string matcher = "rdb_changes_since_last_save:";
+    const string matcher = "rdb_changes_since_last_success_save:";
     const auto pos = str.find(matcher) + matcher.size();
     const auto sub = str.substr(pos, 1);
     return atoi(sub.c_str());
   };
-  auto resp = Run({"set", "k", "1"});
-  resp = Run({"info", "persistence"});
+
+  EXPECT_EQ(Run({"set", "k", "1"}), "OK");
+  auto resp = Run({"info", "persistence"});
   EXPECT_EQ(1, get_rdb_changes_since_last_save(resp.GetString()));
 
-  resp = Run({"set", "k", "1"});
+  EXPECT_EQ(Run({"set", "k", "1"}), "OK");
   resp = Run({"info", "persistence"});
   EXPECT_EQ(2, get_rdb_changes_since_last_save(resp.GetString()));
 
-  resp = Run({"set", "k2", "2"});
+  EXPECT_EQ(Run({"set", "k2", "2"}), "OK");
   resp = Run({"info", "persistence"});
   EXPECT_EQ(3, get_rdb_changes_since_last_save(resp.GetString()));
 
-  resp = Run({"save"});
+  EXPECT_EQ(Run({"save"}), "OK");
   resp = Run({"info", "persistence"});
   EXPECT_EQ(0, get_rdb_changes_since_last_save(resp.GetString()));
 
-  resp = Run({"set", "k2", "2"});
+  EXPECT_EQ(Run({"set", "k2", "2"}), "OK");
   resp = Run({"info", "persistence"});
   EXPECT_EQ(1, get_rdb_changes_since_last_save(resp.GetString()));
 
-  resp = Run({"bgsave"});
-  resp = Run({"info", "persistence"});
-  EXPECT_EQ(0, get_rdb_changes_since_last_save(resp.GetString()));
+  EXPECT_EQ(Run({"bgsave"}), "OK");
+  bool cond = WaitUntilCondition(
+      [&]() {
+        resp = Run({"info", "persistence"});
+        return get_rdb_changes_since_last_save(resp.GetString()) == 0;
+      },
+      500ms);
+  EXPECT_TRUE(cond);
 
-  resp = Run({"set", "k3", "3"});
+  EXPECT_EQ(Run({"set", "k3", "3"}), "OK");
   resp = Run({"info", "persistence"});
   EXPECT_EQ(1, get_rdb_changes_since_last_save(resp.GetString()));
 
-  resp = Run({"del", "k3"});
+  EXPECT_THAT(Run({"del", "k3"}), IntArg(1));
   resp = Run({"info", "persistence"});
-  EXPECT_EQ(1, get_rdb_changes_since_last_save(resp.GetString()));
+  EXPECT_EQ(2, get_rdb_changes_since_last_save(resp.GetString()));
+}
+
+TEST_F(GenericFamilyTest, FieldTtl) {
+  TEST_current_time_ms = kMemberExpiryBase * 1000;  // to reset to test time.
+  EXPECT_THAT(Run({"saddex", "key", "1", "val1"}), IntArg(1));
+  EXPECT_THAT(Run({"saddex", "key", "2", "val2"}), IntArg(1));
+  EXPECT_THAT(Run({"sadd", "key", "val3"}), IntArg(1));
+
+  EXPECT_EQ(-2, CheckedInt({"fieldttl", "nokey", "val1"}));  // key not found
+  EXPECT_EQ(-3, CheckedInt({"fieldttl", "key", "bar"}));     // field not found
+  EXPECT_EQ(1, CheckedInt({"fieldttl", "key", "val1"}));
+  EXPECT_EQ(2, CheckedInt({"fieldttl", "key", "val2"}));
+  EXPECT_EQ(-1, CheckedInt({"fieldttl", "key", "val3"}));
+
+  AdvanceTime(1100);
+  EXPECT_EQ(-3, CheckedInt({"fieldttl", "key", "val1"}));
+  EXPECT_EQ(1, CheckedInt({"fieldttl", "key", "val2"}));
+
+  Run({"set", "str", "val"});
+  EXPECT_THAT(Run({"fieldttl", "str", "bar"}), ErrArg("wrong"));
+
+  EXPECT_EQ(2, CheckedInt({"HSETEX", "k2", "1", "f1", "v1", "f2", "v2"}));
+  EXPECT_EQ(1, CheckedInt({"HSET", "k2", "f3", "v3"}));
+
+  EXPECT_EQ(1, CheckedInt({"fieldttl", "k2", "f1"}));
+  EXPECT_EQ(-1, CheckedInt({"fieldttl", "k2", "f3"}));
+  EXPECT_EQ(-3, CheckedInt({"fieldttl", "k2", "f4"}));
+}
+
+TEST_F(GenericFamilyTest, RandomKey) {
+  auto resp = Run({"randomkey"});
+  EXPECT_EQ(resp.type, RespExpr::NIL);
+
+  resp = Run({"set", "k1", "1"});
+  EXPECT_EQ(Run({"randomkey"}), "k1");
+}
+
+TEST_F(GenericFamilyTest, JsonType) {
+  auto resp = Run({"json.set", "json", "$", R"({"example":"value"})"});
+  EXPECT_EQ(resp, "OK");
+
+  resp = Run({"type", "json"});
+  EXPECT_EQ(resp, "ReJSON-RL") << "For the Redis GUI the register of the JSON type is important. "
+                                  "See https://github.com/dragonflydb/dragonfly/issues/3386";
+
+  // Test json type lowercase works for the SCAN commmand
+  resp = Run({"scan", "0", "type", "rejson-rl"});
+  EXPECT_THAT(resp, ArrLen(2));
+  auto vec = StrArray(resp.GetVec()[1]);
+  ASSERT_THAT(vec, ElementsAre("json"));
+}
+
+TEST_F(GenericFamilyTest, FieldExpireSet) {
+  Run({"SADD", "key", "a", "b", "c"});
+  EXPECT_THAT(Run({"FIELDEXPIRE", "key", "10", "a", "b", "c"}),
+              RespArray(ElementsAre(IntArg(1), IntArg(1), IntArg(1))));
+  AdvanceTime(10'000);
+  EXPECT_THAT(Run({"SMEMBERS", "key"}), RespArray(ElementsAre()));
+}
+
+TEST_F(GenericFamilyTest, FieldExpireHset) {
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_EQ(CheckedInt({"HSET", "key", absl::StrCat("k", i), "v"}), 1);
+  }
+  EXPECT_THAT(Run({"FIELDEXPIRE", "key", "10", "k0", "k1", "k2"}),
+              RespArray(ElementsAre(IntArg(1), IntArg(1), IntArg(1))));
+  AdvanceTime(10'000);
+  EXPECT_THAT(Run({"HGETALL", "key"}), RespArray(ElementsAre()));
+}
+
+TEST_F(GenericFamilyTest, FieldExpireNoSuchField) {
+  EXPECT_EQ(CheckedInt({"SADD", "key", "a"}), 1);
+  EXPECT_EQ(CheckedInt({"HSET", "key2", "k0", "v0"}), 1);
+  EXPECT_THAT(Run({"FIELDEXPIRE", "key", "10", "a", "b"}),
+              RespArray(ElementsAre(IntArg(1), IntArg(-2))));
+  EXPECT_THAT(Run({"FIELDEXPIRE", "key2", "10", "k0", "b"}),
+              RespArray(ElementsAre(IntArg(1), IntArg(-2))));
+}
+
+TEST_F(GenericFamilyTest, FieldExpireNoSuchKey) {
+  EXPECT_THAT(Run({"FIELDEXPIRE", "key", "10", "a", "b"}),
+              RespArray(ElementsAre(IntArg(-2), IntArg(-2))));
+}
+
+TEST_F(GenericFamilyTest, ExpireTime) {
+  EXPECT_EQ(-2, CheckedInt({"EXPIRETIME", "foo"}));
+  EXPECT_EQ(-2, CheckedInt({"PEXPIRETIME", "foo"}));
+  Run({"set", "foo", "bar"});
+  EXPECT_EQ(-1, CheckedInt({"EXPIRETIME", "foo"}));
+  EXPECT_EQ(-1, CheckedInt({"PEXPIRETIME", "foo"}));
+
+  // set expiry
+  uint64_t expire_time_in_ms = TEST_current_time_ms + 5000;
+  uint64_t expire_time_in_seconds = (expire_time_in_ms + 500) / 1000;
+  Run({"pexpireat", "foo", absl::StrCat(expire_time_in_ms)});
+  EXPECT_EQ(expire_time_in_seconds, CheckedInt({"EXPIRETIME", "foo"}));
+  EXPECT_EQ(expire_time_in_ms, CheckedInt({"PEXPIRETIME", "foo"}));
+}
+
+TEST_F(GenericFamilyTest, RestoreOOM) {
+  max_memory_limit = 20000000;
+  Run({"set", "src", string(5000, 'x')});
+  auto resp = Run({"dump", "src"});
+
+  string dump = resp.GetString();
+
+  // Let Dragonfly propagate max_memory_limit to shards. It does not have to be precise,
+  // the loop should have enough time for the internal processes to progress.
+  usleep(10000);
+  unsigned i = 0;
+  for (; i < 10000; ++i) {
+    resp = Run({"restore", absl::StrCat("dst", i), "0", dump});
+    if (resp != "OK")
+      break;
+  }
+  ASSERT_LT(i, 10000);
+  EXPECT_THAT(resp, ErrArg("Out of memory"));
+}
+
+TEST_F(GenericFamilyTest, Bug4466) {
+  auto resp = Run({"SCAN", "9223372036854775808"});  // an invalid cursor should not crash us.
+  EXPECT_THAT(resp, RespElementsAre("0", RespElementsAre()));
+}
+
+TEST_F(GenericFamilyTest, Unlink) {
+  for (unsigned i = 0; i < 1000; ++i) {
+    unsigned start = i * 10;
+    vector<string> cmd = {"SADD", "s1"};
+    for (unsigned j = 0; j < 10; ++j) {
+      cmd.push_back(absl::StrCat("f", start + j));
+    }
+    auto resp = Run(absl::MakeSpan(cmd));
+    ASSERT_THAT(resp, IntArg(10));
+    cmd[1] = "s2";
+    resp = Run(absl::MakeSpan(cmd));
+    ASSERT_THAT(resp, IntArg(10));
+  }
+  auto resp = Run({"unlink", "s1", "s2"});
+  EXPECT_THAT(resp, IntArg(2));
 }
 
 }  // namespace dfly

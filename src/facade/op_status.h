@@ -13,10 +13,12 @@ enum class OpStatus : uint16_t {
   OK,
   KEY_EXISTS,
   KEY_NOTFOUND,
+  KEY_MOVED,
   SKIPPED,
   INVALID_VALUE,
   OUT_OF_RANGE,
   WRONG_TYPE,
+  WRONG_JSON_TYPE,
   TIMED_OUT,
   OUT_OF_MEMORY,
   INVALID_FLOAT,
@@ -24,12 +26,13 @@ enum class OpStatus : uint16_t {
   SYNTAX_ERR,
   BUSY_GROUP,
   STREAM_ID_SMALL,
-  ENTRIES_ADDED_SMALL,
   INVALID_NUMERIC_RESULT,
   CANCELLED,
+  AT_LEAST_ONE_KEY,
+  MEMBER_NOTFOUND,
+  INVALID_JSON_PATH,
+  INVALID_JSON,
 };
-
-const char* DebugString(OpStatus op);
 
 class OpResultBase {
  public:
@@ -60,7 +63,10 @@ class OpResultBase {
 
 template <typename V> class OpResult : public OpResultBase {
  public:
-  OpResult(V v) : v_(std::move(v)) {
+  OpResult(V&& v) : v_(std::move(v)) {
+  }
+
+  OpResult(const V& v) : v_(v) {
   }
 
   using OpResultBase::OpResultBase;
@@ -81,15 +87,19 @@ template <typename V> class OpResult : public OpResultBase {
     return &v_;
   }
 
-  V& operator*() {
+  V& operator*() & {
     return v_;
+  }
+
+  V&& operator*() && {
+    return std::move(v_);
   }
 
   const V* operator->() const {
     return &v_;
   }
 
-  const V& operator*() const {
+  const V& operator*() const& {
     return v_;
   }
 
@@ -125,6 +135,8 @@ template <typename V> class OpResultTyped : public OpResult<V> {
 inline bool operator==(OpStatus st, const OpResultBase& ob) {
   return ob.operator==(st);
 }
+
+std::string_view StatusToMsg(OpStatus status);
 
 }  // namespace facade
 

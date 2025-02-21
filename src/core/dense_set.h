@@ -3,18 +3,14 @@
 //
 #pragma once
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <type_traits>
+#include <vector>
 
-#ifdef __clang__
-#include <experimental/memory_resource>
-namespace PMR_NS = std::experimental::pmr;
-#else
-#include <memory_resource>
-namespace PMR_NS = std::pmr;
-#endif
+#include "base/pmr/memory_resource.h"
 
 namespace dfly {
 
@@ -46,12 +42,12 @@ class DenseSet {
   // we can assume that high 12 bits of user address space
   // can be used for tagging. At most 52 bits of address are reserved for
   // some configurations, and usually it's 48 bits.
-  // https://www.kernel.org/doc/html/latest/arm64/memory.html
+  // https://docs.kernel.org/arch/arm64/memory.html
   static constexpr size_t kLinkBit = 1ULL << 52;
   static constexpr size_t kDisplaceBit = 1ULL << 53;
   static constexpr size_t kDisplaceDirectionBit = 1ULL << 54;
   static constexpr size_t kTtlBit = 1ULL << 55;
-  static constexpr size_t kTagMask = 4095ULL << 51;  // we reserve 12 high bits.
+  static constexpr size_t kTagMask = 4095ULL << 52;  // we reserve 12 high bits.
 
   class DensePtr {
    public:
@@ -134,6 +130,7 @@ class DenseSet {
 
     // Sets pointer but preserves tagging info
     void SetObject(void* obj) {
+      assert(IsObject());
       ptr_ = (void*)((uptr() & kTagMask) | (uintptr_t(obj) & ~kTagMask));
     }
 
@@ -179,6 +176,24 @@ class DenseSet {
   using ChainVectorConstIterator = std::vector<DensePtr, DensePtrAllocator>::const_iterator;
 
   class IteratorBase {
+    friend class DenseSet;
+
+   public:
+    IteratorBase(DenseSet* owner, ChainVectorIterator list_it, DensePtr* e)
+        : owner_(owner), curr_list_(list_it), curr_entry_(e) {
+    }
+
+    // returns the expiry time of the current entry or UINT32_MAX if no ttl is set.
+    uint32_t ExpiryTime() const {
+      return curr_entry_->HasTtl() ? owner_->ObjExpireTime(curr_entry_->GetObject()) : UINT32_MAX;
+    }
+
+    void SetExpiryTime(uint32_t ttl_sec);
+
+    bool HasExpiry() const {
+      return curr_entry_->HasTtl();
+    }
+
    protected:
     IteratorBase() : owner_(nullptr), curr_entry_(nullptr) {
     }
@@ -194,13 +209,27 @@ class DenseSet {
 
  public:
   using MemoryResource = PMR_NS::memory_resource;
+  static constexpr uint32_t kMaxBatchLen = 32;
 
   explicit DenseSet(MemoryResource* mr = PMR_NS::get_default_resource());
   virtual ~DenseSet();
 
-  size_t Size() const {
+  void Clear() {
+    ClearStep(0, entries_.size());
+  }
+
+  // Returns the next bucket index that should be cleared.
+  // Returns BucketCount when all objects are erased.
+  uint32_t ClearStep(uint32_t start, uint32_t count);
+
+  // Returns the number of elements in the map. Note that it might be that some of these elements
+  // have expired and can't be accessed.
+  size_t UpperBoundSize() const {
     return size_;
   }
+
+  // Returns an accurate size, post-expiration. O(n).
+  size_t SizeSlow();
 
   bool Empty() const {
     return size_ == 0;
@@ -208,11 +237,6 @@ class DenseSet {
 
   size_t BucketCount() const {
     return entries_.size();
-  }
-
-  // those that are chained to the entries stored inline in the bucket array.
-  size_t NumChainEntries() const {
-    return num_chain_entries_;
   }
 
   size_t NumUsedBuckets() const {
@@ -224,13 +248,15 @@ class DenseSet {
   }
 
   size_t SetMallocUsed() const {
-    return (num_chain_entries_ + entries_.capacity()) * sizeof(DensePtr);
+    return entries_.capacity() * sizeof(DensePtr) + num_links_ * sizeof(DenseLinkKey);
   }
 
   using ItemCb = std::function<void(const void*)>;
 
   uint32_t Scan(uint32_t cursor, const ItemCb& cb) const;
   void Reserve(size_t sz);
+
+  void Fill(DenseSet* other) const;
 
   // set an abstract time that allows expiry.
   void set_time(uint32_t val) {
@@ -241,13 +267,21 @@ class DenseSet {
     return time_now_;
   }
 
+  bool ExpirationUsed() const {
+    return expiration_used_;
+  }
+
  protected:
   // Virtual functions to be implemented for generic data
   virtual uint64_t Hash(const void* obj, uint32_t cookie) const = 0;
   virtual bool ObjEqual(const void* left, const void* right, uint32_t right_cookie) const = 0;
   virtual size_t ObjectAllocSize(const void* obj) const = 0;
   virtual uint32_t ObjExpireTime(const void* obj) const = 0;
+  virtual void ObjUpdateExpireTime(const void* obj, uint32_t ttl_sec) = 0;
   virtual void ObjDelete(void* obj, bool has_ttl) const = 0;
+  virtual void* ObjectClone(const void* obj, bool has_ttl, bool add_ttl) const = 0;
+
+  void CollectExpired();
 
   bool EraseInternal(void* obj, uint32_t cookie) {
     auto [prev, found] = Find(obj, BucketId(obj, cookie), cookie);
@@ -258,13 +292,20 @@ class DenseSet {
     return false;
   }
 
-  void* FindInternal(const void* obj, uint32_t cookie) const;
-  void* PopInternal();
+  void* FindInternal(const void* obj, uint64_t hashcode, uint32_t cookie) const;
 
-  // Note this does not free any dynamic allocations done by derived classes, that a DensePtr
-  // in the set may point to. This function only frees the allocated DenseLinkKeys created by
-  // DenseSet. All data allocated by a derived class should be freed before calling this
-  void ClearInternal();
+  IteratorBase FindIt(const void* ptr, uint32_t cookie) {
+    if (Empty())
+      return IteratorBase{};
+
+    auto [bid, _, curr] = Find2(ptr, BucketId(ptr, cookie), cookie);
+    if (curr) {
+      return IteratorBase(this, entries_.begin() + bid, curr);
+    }
+    return IteratorBase{};
+  }
+
+  void* PopInternal();
 
   void IncreaseMallocUsed(size_t delta) {
     obj_malloc_used_ += delta;
@@ -274,16 +315,14 @@ class DenseSet {
     obj_malloc_used_ -= delta;
   }
 
-  // Returns previous if the equivalent object already exists,
-  // Returns nullptr if obj was added.
-  void* AddOrFindObj(void* obj, bool has_ttl) {
-    DensePtr* ptr = AddOrFindDense(obj, has_ttl);
-    return ptr ? ptr->GetObject() : nullptr;
-  }
-
   // Returns the previous object if it has been replaced.
   // nullptr, if obj was added.
   void* AddOrReplaceObj(void* obj, bool has_ttl);
+
+  // Assumes that the object does not exist in the set.
+  void AddUnique(void* obj, bool has_ttl, uint64_t hashcode);
+
+  void Prefetch(uint64_t hash);
 
  private:
   DenseSet(const DenseSet&) = delete;
@@ -291,11 +330,23 @@ class DenseSet {
 
   bool Equal(DensePtr dptr, const void* ptr, uint32_t cookie) const;
 
+  struct CloneItem {
+    DensePtr ptr;
+    void* obj = nullptr;
+    bool has_ttl = false;
+  };
+
+  void CloneBatch(unsigned len, CloneItem* items, DenseSet* other) const;
+
+  using ClearItem = CloneItem;
+  void ClearBatch(unsigned len, ClearItem* items);
+
   MemoryResource* mr() {
     return entries_.get_allocator().resource();
   }
 
   uint32_t BucketId(uint64_t hash) const {
+    assert(capacity_log_ > 0);
     return hash >> (64 - capacity_log_);
   }
 
@@ -305,36 +356,46 @@ class DenseSet {
 
   // return a ChainVectorIterator (a.k.a iterator) or end if there is an empty chain found
   ChainVectorIterator FindEmptyAround(uint32_t bid);
-  // return if bucket has no item which is not displaced and right/left bucket has no displaced item
+
+  // Return if bucket has no item which is not displaced and right/left bucket has no displaced item
   // belong to given bid
   bool NoItemBelongsBucket(uint32_t bid) const;
-  void Grow();
+  void Grow(size_t prev_size);
 
   // ============ Pseudo Linked List Functions for interacting with Chains ==================
   size_t PushFront(ChainVectorIterator, void* obj, bool has_ttl);
   void PushFront(ChainVectorIterator, DensePtr);
 
-  void* PopDataFront(ChainVectorIterator);
   DensePtr PopPtrFront(ChainVectorIterator);
-
-  // Returns DensePtr if the object with such key already exists,
-  // Returns null if obj was added.
-  DensePtr* AddOrFindDense(void* obj, bool has_ttl);
 
   // ============ Pseudo Linked List in DenseSet end ==================
 
   // returns (prev, item) pair. If item is root, then prev is null.
-  std::pair<DensePtr*, DensePtr*> Find(const void* ptr, uint32_t bid, uint32_t cookie);
+  std::pair<DensePtr*, DensePtr*> Find(const void* ptr, uint32_t bid, uint32_t cookie) {
+    auto [_, p, c] = Find2(ptr, bid, cookie);
+    return {p, c};
+  }
+
+  // returns bid and (prev, item) pair. If item is root, then prev is null.
+  std::tuple<size_t, DensePtr*, DensePtr*> Find2(const void* ptr, uint32_t bid, uint32_t cookie);
 
   DenseLinkKey* NewLink(void* data, DensePtr next);
 
   inline void FreeLink(DenseLinkKey* plink) {
     // deallocate the link if it is no longer a link as it is now in an empty list
     mr()->deallocate(plink, sizeof(DenseLinkKey), alignof(DenseLinkKey));
+    --num_links_;
   }
 
-  // Returns true if *ptr was deleted.
-  bool ExpireIfNeeded(DensePtr* prev, DensePtr* ptr) const;
+  // Returns true if *node was deleted.
+  bool ExpireIfNeeded(DensePtr* prev, DensePtr* node) const {
+    if (node->HasTtl()) {
+      return ExpireIfNeededInternal(prev, node);
+    }
+    return false;
+  }
+
+  bool ExpireIfNeededInternal(DensePtr* prev, DensePtr* node) const;
 
   // Deletes the object pointed by ptr and removes it from the set.
   // If ptr is a link then it will be deleted internally.
@@ -343,19 +404,22 @@ class DenseSet {
   std::vector<DensePtr, DensePtrAllocator> entries_;
 
   mutable size_t obj_malloc_used_ = 0;
-  mutable uint32_t size_ = 0;
-  mutable uint32_t num_chain_entries_ = 0;
-  mutable uint32_t num_used_buckets_ = 0;
+  mutable uint32_t size_ = 0;              // number of elements in the set.
+  mutable uint32_t num_links_ = 0;         // number of links in the set.
+  mutable uint32_t num_used_buckets_ = 0;  // number of buckets used in entries_ array.
   unsigned capacity_log_ = 0;
 
   uint32_t time_now_ = 0;
+
+  mutable bool expiration_used_ = false;
 };
 
-inline void* DenseSet::FindInternal(const void* obj, uint32_t cookie) const {
+inline void* DenseSet::FindInternal(const void* obj, uint64_t hashcode, uint32_t cookie) const {
   if (entries_.empty())
     return nullptr;
 
-  DensePtr* ptr = const_cast<DenseSet*>(this)->Find(obj, BucketId(obj, cookie), cookie).second;
+  uint32_t bid = BucketId(hashcode);
+  DensePtr* ptr = const_cast<DenseSet*>(this)->Find(obj, bid, cookie).second;
   return ptr ? ptr->GetObject() : nullptr;
 }
 

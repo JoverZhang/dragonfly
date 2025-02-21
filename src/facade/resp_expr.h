@@ -8,8 +8,11 @@
 #include <absl/types/span.h>
 
 #include <optional>
+#include <string_view>
 #include <variant>
 #include <vector>
+
+#include "facade/facade_types.h"
 
 namespace facade {
 
@@ -32,9 +35,13 @@ class RespExpr {
     return Buffer{reinterpret_cast<uint8_t*>(s->data()), s->size()};
   }
 
-  std::string GetString() const {
+  std::string_view GetView() const {
     Buffer buffer = GetBuf();
     return {reinterpret_cast<const char*>(buffer.data()), buffer.size()};
+  }
+
+  std::string GetString() const {
+    return std::string(GetView());
   }
 
   Buffer GetBuf() const {
@@ -50,14 +57,20 @@ class RespExpr {
                                               : std::nullopt;
   }
 
+  size_t UsedMemory() const {
+    return 0;
+  }
+
   static const char* TypeName(Type t);
+
+  static void VecToArgList(const Vec& src, CmdArgVec* dest);
 };
 
 using RespVec = RespExpr::Vec;
 using RespSpan = absl::Span<const RespExpr>;
 
-inline std::string_view ToSV(const absl::Span<uint8_t>& s) {
-  return std::string_view{reinterpret_cast<char*>(s.data()), s.size()};
+inline std::string_view ToSV(RespExpr::Buffer buf) {
+  return std::string_view{reinterpret_cast<char*>(buf.data()), buf.size()};
 }
 
 }  // namespace facade

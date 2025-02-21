@@ -3,13 +3,24 @@
 //
 #include "facade/reply_builder.h"
 
+#include <absl/cleanup/cleanup.h>
 #include <absl/container/fixed_array.h>
 #include <absl/strings/numbers.h>
 #include <absl/strings/str_cat.h>
 #include <double-conversion/double-to-string.h>
 
+#include "absl/strings/escaping.h"
 #include "base/logging.h"
+#include "core/heap_size.h"
 #include "facade/error.h"
+#include "util/fibers/proactor_base.h"
+
+#ifdef __APPLE__
+#ifndef UIO_MAXIOV
+// Some versions of MacOSX dont have IOV_MAX
+#define UIO_MAXIOV 1024
+#endif
+#endif
 
 using namespace std;
 using absl::StrAppend;
@@ -19,24 +30,67 @@ namespace facade {
 
 namespace {
 
-inline iovec constexpr IoVec(std::string_view s) {
-  iovec r{const_cast<char*>(s.data()), s.size()};
-  return r;
-}
-
 constexpr char kCRLF[] = "\r\n";
-constexpr char kErrPref[] = "-ERR ";
 constexpr char kSimplePref[] = "+";
+constexpr char kLengthPrefix[] = "$";
+constexpr char kDoublePref[] = ",";
+constexpr char kLongPref[] = ":";
+constexpr char kNullStringR2[] = "$-1\r\n";
+constexpr char kNullStringR3[] = "_\r\n";
 
 constexpr unsigned kConvFlags =
     DoubleToStringConverter::UNIQUE_ZERO | DoubleToStringConverter::EMIT_POSITIVE_EXPONENT_SIGN;
 
 DoubleToStringConverter dfly_conv(kConvFlags, "inf", "nan", 'e', -6, 21, 6, 0);
 
+template <typename T> size_t piece_size(const T& v) {
+  if constexpr (is_array_v<T>)
+    return ABSL_ARRAYSIZE(v) - 1;  // expect null terminated
+  else if constexpr (is_integral_v<T>)
+    return absl::numbers_internal::kFastToBufferSize;
+  else  // string_view
+    return v.size();
+}
+
+template <size_t S> char* write_piece(const char (&arr)[S], char* dest) {
+  return (char*)memcpy(dest, arr, S - 1) + (S - 1);
+}
+
+template <typename T> enable_if_t<is_integral_v<T>, char*> write_piece(T num, char* dest) {
+  static_assert(!is_same_v<T, char>, "Use arrays for single chars");
+  return absl::numbers_internal::FastIntToBuffer(num, dest);
+}
+
+char* write_piece(string_view str, char* dest) {
+  return (char*)memcpy(dest, str.data(), str.size()) + str.size();
+}
+
 }  // namespace
 
-SinkReplyBuilder::SinkReplyBuilder(::io::Sink* sink)
-    : sink_(sink), should_batch_(false), should_aggregate_(false) {
+thread_local SinkReplyBuilder::PendingList SinkReplyBuilder::pending_list;
+
+SinkReplyBuilder::ReplyAggregator::~ReplyAggregator() {
+  rb->batched_ = prev;
+  if (!prev)
+    rb->Flush();
+}
+
+SinkReplyBuilder::ReplyScope::~ReplyScope() {
+  rb->scoped_ = prev;
+  if (!prev)
+    rb->FinishScope();
+}
+
+void SinkReplyBuilder::SendError(ErrorReply error) {
+  if (error.status)
+    return SendError(*error.status);
+  SendError(error.ToSv(), error.kind);
+}
+
+void SinkReplyBuilder::SendError(OpStatus status) {
+  if (status == OpStatus::OK)
+    return SendSimpleString("OK");
+  SendError(StatusToMsg(status));
 }
 
 void SinkReplyBuilder::CloseConnection() {
@@ -44,122 +98,161 @@ void SinkReplyBuilder::CloseConnection() {
     ec_ = std::make_error_code(std::errc::connection_aborted);
 }
 
-void SinkReplyBuilder::Send(const iovec* v, uint32_t len) {
-  DCHECK(sink_);
-  constexpr size_t kMaxBatchSize = 1024;
+template <typename... Ts> void SinkReplyBuilder::WritePieces(Ts&&... pieces) {
+  if (size_t required = (piece_size(pieces) + ...); buffer_.AppendLen() <= required)
+    Flush(required);
 
-  size_t bsize = 0;
-  for (unsigned i = 0; i < len; ++i) {
-    bsize += v[i].iov_len;
+  auto iovec_end = [](const iovec& v) { return reinterpret_cast<char*>(v.iov_base) + v.iov_len; };
+
+  // Ensure last iovec points to buffer segment
+  char* dest = reinterpret_cast<char*>(buffer_.AppendBuffer().data());
+  if (vecs_.empty()) {
+    vecs_.push_back(iovec{dest, 0});
+  } else if (iovec_end(vecs_.back()) != dest) {
+    if (vecs_.size() >= IOV_MAX - 2)
+      Flush();
+    dest = reinterpret_cast<char*>(buffer_.AppendBuffer().data());
+    vecs_.push_back(iovec{dest, 0});
   }
 
-  // Allow batching with up to 8K of data.
-  if ((should_batch_ || should_aggregate_) && (batch_.size() + bsize < kMaxBatchSize)) {
-    for (unsigned i = 0; i < len; ++i) {
-      std::string_view src((char*)v[i].iov_base, v[i].iov_len);
-      DVLOG(2) << "Appending to stream " << src;
-      batch_.append(src.data(), src.size());
+  DCHECK(iovec_end(vecs_.back()) == dest);
+  char* ptr = dest;
+  ([&]() { ptr = write_piece(pieces, ptr); }(), ...);
+
+  size_t written = ptr - dest;
+  buffer_.CommitWrite(written);
+  vecs_.back().iov_len += written;
+  total_size_ += written;
+}
+
+void SinkReplyBuilder::WriteRef(std::string_view str) {
+  if (vecs_.size() >= IOV_MAX - 2)
+    Flush();
+  vecs_.push_back(iovec{const_cast<char*>(str.data()), str.size()});
+  total_size_ += str.size();
+}
+
+void SinkReplyBuilder::Flush(size_t expected_buffer_cap) {
+  if (!vecs_.empty())
+    Send();
+
+  // Grow backing buffer if was at least half full and still below it's max size
+  if (buffer_.InputLen() * 2 > buffer_.Capacity() && buffer_.Capacity() * 2 <= kMaxBufferSize)
+    expected_buffer_cap = max(expected_buffer_cap, buffer_.Capacity() * 2);
+
+  total_size_ = 0;
+  buffer_.Clear();
+  vecs_.clear();
+  guaranteed_pieces_ = 0;
+
+  DCHECK_LE(expected_buffer_cap, kMaxBufferSize);  // big strings should be enqueued as iovecs
+  if (expected_buffer_cap > buffer_.Capacity())
+    buffer_.Reserve(expected_buffer_cap);
+}
+
+void SinkReplyBuilder::Send() {
+  DCHECK(sink_ != nullptr);
+  DCHECK(!vecs_.empty());
+  auto& reply_stats = tl_facade_stats->reply_stats;
+
+  send_active_ = true;
+  PendingPin pin(util::fb2::ProactorBase::GetMonotonicTimeNs());
+
+  pending_list.push_back(pin);
+
+  reply_stats.io_write_cnt++;
+  reply_stats.io_write_bytes += total_size_;
+  DVLOG(2) << "Writing " << total_size_ << " bytes";
+  if (auto ec = sink_->Write(vecs_.data(), vecs_.size()); ec)
+    ec_ = ec;
+
+  auto it = PendingList::s_iterator_to(pin);
+  pending_list.erase(it);
+
+  uint64_t after_ns = util::fb2::ProactorBase::GetMonotonicTimeNs();
+  reply_stats.send_stats.count++;
+  reply_stats.send_stats.total_duration += (after_ns - pin.timestamp_ns) / 1'000;
+  DVLOG(2) << "Finished writing " << total_size_ << " bytes";
+  send_active_ = false;
+}
+
+void SinkReplyBuilder::FinishScope() {
+  replies_recorded_++;
+
+  if (!batched_ || total_size_ * 2 >= kMaxBufferSize)
+    return Flush();
+
+  // Check if we have enough space to copy all refs to buffer
+  size_t ref_bytes = total_size_ - buffer_.InputLen();
+  if (ref_bytes > buffer_.AppendLen())
+    return Flush(ref_bytes);
+
+  // Copy all external references to buffer to safely keep batching
+  for (size_t i = guaranteed_pieces_; i < vecs_.size(); i++) {
+    auto ib = buffer_.InputBuffer();
+    if (vecs_[i].iov_base >= ib.data() && vecs_[i].iov_base <= ib.data() + ib.size())
+      continue;  // this is a piece
+
+    DCHECK_LE(vecs_[i].iov_len, buffer_.AppendLen());
+    void* dest = buffer_.AppendBuffer().data();
+    memcpy(dest, vecs_[i].iov_base, vecs_[i].iov_len);
+    buffer_.CommitWrite(vecs_[i].iov_len);
+    vecs_[i].iov_base = dest;
+  }
+  guaranteed_pieces_ = vecs_.size();  // all vecs are pieces
+}
+
+MCReplyBuilder::MCReplyBuilder(::io::Sink* sink) : SinkReplyBuilder(sink), all_(0) {
+}
+
+void MCReplyBuilder::SendValue(std::string_view key, std::string_view value, uint64_t mc_ver,
+                               uint32_t mc_flag) {
+  ReplyScope scope(this);
+  if (flag_.meta) {
+    string flags;
+    if (flag_.return_mcflag)
+      absl::StrAppend(&flags, " f", mc_flag);
+    if (flag_.return_version)
+      absl::StrAppend(&flags, " c", mc_ver);
+    if (flag_.return_value) {
+      WritePieces("VA ", value.size(), flags, kCRLF, value, kCRLF);
+    } else {
+      WritePieces("HD ", flags, kCRLF);
     }
-    return;
-  }
-
-  error_code ec;
-  ++io_write_cnt_;
-  io_write_bytes_ += bsize;
-  DVLOG(2) << "Writing " << bsize << " bytes of len " << len;
-
-  if (batch_.empty()) {
-    ec = sink_->Write(v, len);
   } else {
-    DVLOG(2) << "Sending batch to stream " << sink_ << "\n" << batch_;
+    WritePieces("VALUE ", key, " ", mc_flag, " ", value.size());
+    if (mc_ver)
+      WritePieces(" ", mc_ver);
 
-    io_write_bytes_ += batch_.size();
-
-    iovec tmp[len + 1];
-    tmp[0].iov_base = batch_.data();
-    tmp[0].iov_len = batch_.size();
-    copy(v, v + len, tmp + 1);
-    ec = sink_->Write(tmp, len + 1);
-    batch_.clear();
+    if (value.size() <= kMaxInlineSize) {
+      WritePieces(kCRLF, value, kCRLF);
+    } else {
+      WritePieces(kCRLF);
+      WriteRef(value);
+      WritePieces(kCRLF);
+    }
   }
-
-  if (ec) {
-    ec_ = ec;
-  }
-}
-
-void SinkReplyBuilder::SendRaw(std::string_view raw) {
-  iovec v = {IoVec(raw)};
-
-  Send(&v, 1);
-}
-
-void SinkReplyBuilder::SendRawVec(absl::Span<const std::string_view> msg_vec) {
-  absl::FixedArray<iovec, 16> arr(msg_vec.size());
-
-  for (unsigned i = 0; i < msg_vec.size(); ++i) {
-    arr[i].iov_base = const_cast<char*>(msg_vec[i].data());
-    arr[i].iov_len = msg_vec[i].size();
-  }
-  Send(arr.data(), msg_vec.size());
-}
-
-void SinkReplyBuilder::StopAggregate() {
-  should_aggregate_ = false;
-
-  if (should_batch_ || batch_.empty())
-    return;
-
-  error_code ec = sink_->Write(io::Buffer(batch_));
-  batch_.clear();
-
-  if (ec)
-    ec_ = ec;
-}
-
-MCReplyBuilder::MCReplyBuilder(::io::Sink* sink) : SinkReplyBuilder(sink), noreply_(false) {
 }
 
 void MCReplyBuilder::SendSimpleString(std::string_view str) {
-  if (noreply_)
+  if (flag_.noreply)
     return;
 
-  iovec v[2] = {IoVec(str), IoVec(kCRLF)};
-
-  Send(v, ABSL_ARRAYSIZE(v));
+  ReplyScope scope(this);
+  WritePieces(str, kCRLF);
 }
 
 void MCReplyBuilder::SendStored() {
-  SendSimpleString("STORED");
+  SendSimpleString(flag_.meta ? "HD" : "STORED");
 }
 
 void MCReplyBuilder::SendLong(long val) {
-  char buf[32];
-  char* next = absl::numbers_internal::FastIntToBuffer(val, buf);
-  SendSimpleString(string_view(buf, next - buf));
-}
-
-void MCReplyBuilder::SendMGetResponse(absl::Span<const OptResp> arr) {
-  string header;
-  for (unsigned i = 0; i < arr.size(); ++i) {
-    if (arr[i]) {
-      const auto& src = *arr[i];
-      absl::StrAppend(&header, "VALUE ", src.key, " ", src.mc_flag, " ", src.value.size());
-      if (src.mc_ver) {
-        absl::StrAppend(&header, " ", src.mc_ver);
-      }
-
-      absl::StrAppend(&header, "\r\n");
-      iovec v[] = {IoVec(header), IoVec(src.value), IoVec(kCRLF)};
-      Send(v, ABSL_ARRAYSIZE(v));
-      header.clear();
-    }
-  }
-  SendSimpleString("END");
+  SendSimpleString(absl::StrCat(val));
 }
 
 void MCReplyBuilder::SendError(string_view str, std::string_view type) {
-  SendSimpleString("ERROR");
+  last_error_ = str;
+  SendSimpleString(absl::StrCat("SERVER_ERROR ", str));
 }
 
 void MCReplyBuilder::SendProtocolError(std::string_view str) {
@@ -167,67 +260,181 @@ void MCReplyBuilder::SendProtocolError(std::string_view str) {
 }
 
 void MCReplyBuilder::SendClientError(string_view str) {
-  iovec v[] = {IoVec("CLIENT_ERROR "), IoVec(str), IoVec(kCRLF)};
-  Send(v, ABSL_ARRAYSIZE(v));
+  SendSimpleString(absl::StrCat("CLIENT_ERROR ", str));
 }
 
 void MCReplyBuilder::SendSetSkipped() {
-  SendSimpleString("NOT_STORED");
+  SendSimpleString(flag_.meta ? "NS" : "NOT_STORED");
 }
 
 void MCReplyBuilder::SendNotFound() {
-  SendSimpleString("NOT_FOUND");
+  SendSimpleString(flag_.meta ? "NF" : "NOT_FOUND");
 }
 
-size_t RedisReplyBuilder::WrappedStrSpan::Size() const {
-  return visit([](auto arr) { return arr.size(); }, (const StrSpan&)*this);
+void MCReplyBuilder::SendGetEnd() {
+  if (!flag_.meta)
+    SendSimpleString("END");
 }
 
-string_view RedisReplyBuilder::WrappedStrSpan::operator[](size_t i) const {
-  return visit([i](auto arr) { return string_view{arr[i]}; }, (const StrSpan&)*this);
+void MCReplyBuilder::SendMiss() {
+  if (flag_.meta)
+    SendSimpleString("EN");
 }
 
-char* RedisReplyBuilder::FormatDouble(double val, char* dest, unsigned dest_len) {
-  StringBuilder sb(dest, dest_len);
-  CHECK(dfly_conv.ToShortest(val, &sb));
-  return sb.Finalize();
+void MCReplyBuilder::SendDeleted() {
+  SendSimpleString(flag_.meta ? "HD" : "DELETED");
 }
 
-RedisReplyBuilder::RedisReplyBuilder(::io::Sink* sink) : SinkReplyBuilder(sink) {
+void MCReplyBuilder::SendRaw(std::string_view str) {
+  ReplyScope scope(this);
+  WriteRef(str);
 }
 
-void RedisReplyBuilder::SetResp3(bool is_resp3) {
-  is_resp3_ = is_resp3;
+void RedisReplyBuilderBase::SendNull() {
+  ReplyScope scope(this);
+  IsResp3() ? WritePieces(kNullStringR3) : WritePieces(kNullStringR2);
 }
 
-void RedisReplyBuilder::SendError(string_view str, string_view err_type) {
-  VLOG(1) << "Error: " << str;
+void RedisReplyBuilderBase::SendSimpleString(std::string_view str) {
+  ReplyScope scope(this);
+  if (str.size() <= kMaxInlineSize * 2)
+    return WritePieces(kSimplePref, str, kCRLF);
 
-  if (err_type.empty()) {
-    err_type = str;
-    if (err_type == kSyntaxErr)
-      err_type = kSyntaxErrType;
+  WritePieces(kSimplePref);
+  WriteRef(str);
+  WritePieces(kCRLF);
+}
+
+void RedisReplyBuilderBase::SendBulkString(std::string_view str) {
+  ReplyScope scope(this);
+  if (str.size() <= kMaxInlineSize)
+    return WritePieces(kLengthPrefix, uint32_t(str.size()), kCRLF, str, kCRLF);
+
+  DVLOG(1) << "SendBulk " << str.size();
+  WritePieces(kLengthPrefix, uint32_t(str.size()), kCRLF);
+  WriteRef(str);
+  WritePieces(kCRLF);
+}
+
+void RedisReplyBuilderBase::SendLong(long val) {
+  ReplyScope scope(this);
+  WritePieces(kLongPref, val, kCRLF);
+}
+
+void RedisReplyBuilderBase::SendDouble(double val) {
+  char buf[DoubleToStringConverter::kBase10MaximalLength + 8];  // +8 to be on the safe side.
+  static_assert(ABSL_ARRAYSIZE(buf) < kMaxInlineSize, "Write temporary string from buf inline");
+  string_view val_str = FormatDouble(val, buf, ABSL_ARRAYSIZE(buf));
+
+  if (!IsResp3())
+    return SendBulkString(val_str);
+
+  ReplyScope scope(this);
+  WritePieces(kDoublePref, val_str, kCRLF);
+}
+
+void RedisReplyBuilderBase::SendNullArray() {
+  ReplyScope scope(this);
+  WritePieces("*-1", kCRLF);
+}
+
+constexpr static const char START_SYMBOLS2[4][2] = {"*", "~", "%", ">"};
+static_assert(START_SYMBOLS2[RedisReplyBuilderBase::MAP][0] == '%' &&
+              START_SYMBOLS2[RedisReplyBuilderBase::SET][0] == '~');
+
+void RedisReplyBuilderBase::StartCollection(unsigned len, CollectionType ct) {
+  if (!IsResp3()) {  // RESP2 supports only arrays
+    if (ct == MAP)
+      len *= 2;
+    ct = ARRAY;
   }
-
-  err_count_[err_type]++;
-
-  if (str[0] == '-') {
-    iovec v[] = {IoVec(str), IoVec(kCRLF)};
-    Send(v, ABSL_ARRAYSIZE(v));
-  } else {
-    iovec v[] = {IoVec(kErrPref), IoVec(str), IoVec(kCRLF)};
-    Send(v, ABSL_ARRAYSIZE(v));
-  }
+  ReplyScope scope(this);
+  WritePieces(START_SYMBOLS2[ct], len, kCRLF);
 }
 
-void RedisReplyBuilder::SendProtocolError(std::string_view str) {
+void RedisReplyBuilderBase::SendError(std::string_view str, std::string_view type) {
+  ReplyScope scope(this);
+
+  if (type.empty()) {
+    type = str;
+    if (type == kSyntaxErr)
+      type = kSyntaxErrType;
+  }
+  tl_facade_stats->reply_stats.err_count[type]++;
+  last_error_ = str;
+
+  if (str[0] != '-')
+    WritePieces("-ERR ", str, kCRLF);
+  else
+    WritePieces(str, kCRLF);
+}
+
+void RedisReplyBuilderBase::SendProtocolError(std::string_view str) {
   SendError(absl::StrCat("-ERR Protocol error: ", str), "protocol_error");
 }
 
-void RedisReplyBuilder::SendSimpleString(std::string_view str) {
-  iovec v[3] = {IoVec(kSimplePref), IoVec(str), IoVec(kCRLF)};
+char* RedisReplyBuilderBase::FormatDouble(double d, char* dest, unsigned len) {
+  StringBuilder sb(dest, len);
+  CHECK(dfly_conv.ToShortest(d, &sb));
+  return sb.Finalize();
+}
 
-  Send(v, ABSL_ARRAYSIZE(v));
+void RedisReplyBuilderBase::SendVerbatimString(std::string_view str, VerbatimFormat format) {
+  DCHECK(format <= VerbatimFormat::MARKDOWN);
+  if (!IsResp3())
+    return SendBulkString(str);
+
+  ReplyScope scope(this);
+  WritePieces("=", str.size() + 4, kCRLF, format == VerbatimFormat::MARKDOWN ? "mkd:" : "txt:");
+  if (str.size() <= kMaxInlineSize)
+    WritePieces(str);
+  else
+    WriteRef(str);
+  WritePieces(kCRLF);
+}
+
+std::string RedisReplyBuilderBase::SerializeCommand(std::string_view command) {
+  return string{command} + kCRLF;
+}
+
+void RedisReplyBuilder::SendSimpleStrArr(const facade::ArgRange& strs) {
+  ReplyScope scope(this);
+  StartArray(strs.Size());
+  for (std::string_view str : strs)
+    SendSimpleString(str);
+}
+
+void RedisReplyBuilder::SendBulkStrArr(const facade::ArgRange& strs, CollectionType ct) {
+  ReplyScope scope(this);
+  StartCollection(ct == CollectionType::MAP ? strs.Size() / 2 : strs.Size(), ct);
+  for (std::string_view str : strs)
+    SendBulkString(str);
+}
+
+void RedisReplyBuilder::SendScoredArray(ScoredArray arr, bool with_scores) {
+  ReplyScope scope(this);
+  StartArray((with_scores && !IsResp3()) ? arr.size() * 2 : arr.size());
+  for (const auto& [str, score] : arr) {
+    if (with_scores && IsResp3())
+      StartArray(2);
+    SendBulkString(str);
+    if (with_scores)
+      SendDouble(score);
+  }
+}
+
+void RedisReplyBuilder::SendLabeledScoredArray(std::string_view arr_label, ScoredArray arr) {
+  ReplyScope scope(this);
+
+  StartArray(2);
+
+  SendBulkString(arr_label);
+  StartArray(arr.size());
+  for (const auto& [str, score] : arr) {
+    StartArray(2);
+    SendBulkString(str);
+    SendDouble(score);
+  }
 }
 
 void RedisReplyBuilder::SendStored() {
@@ -238,265 +445,12 @@ void RedisReplyBuilder::SendSetSkipped() {
   SendNull();
 }
 
-const char* RedisReplyBuilder::NullString() {
-  if (is_resp3_) {
-    return "_\r\n";
-  }
-  return "$-1\r\n";
-}
-
-void RedisReplyBuilder::SendNull() {
-  iovec v[] = {IoVec(NullString())};
-
-  Send(v, ABSL_ARRAYSIZE(v));
-}
-
-void RedisReplyBuilder::SendBulkString(std::string_view str) {
-  char tmp[absl::numbers_internal::kFastToBufferSize + 3];
-  tmp[0] = '$';  // Format length
-  char* next = absl::numbers_internal::FastIntToBuffer(uint32_t(str.size()), tmp + 1);
-  *next++ = '\r';
-  *next++ = '\n';
-
-  std::string_view lenpref{tmp, size_t(next - tmp)};
-
-  // 3 parts: length, string and CRLF.
-  iovec v[3] = {IoVec(lenpref), IoVec(str), IoVec(kCRLF)};
-
-  return Send(v, ABSL_ARRAYSIZE(v));
-}
-
-std::string_view RedisReplyBuilder::StatusToMsg(OpStatus status) {
-  switch (status) {
-    case OpStatus::OK:
-      return "OK";
-    case OpStatus::KEY_NOTFOUND:
-      return kKeyNotFoundErr;
-    case OpStatus::WRONG_TYPE:
-      return kWrongTypeErr;
-    case OpStatus::OUT_OF_RANGE:
-      return kIndexOutOfRange;
-    case OpStatus::INVALID_FLOAT:
-      return kInvalidFloatErr;
-    case OpStatus::INVALID_INT:
-      return kInvalidIntErr;
-    case OpStatus::SYNTAX_ERR:
-      return kSyntaxErr;
-    case OpStatus::OUT_OF_MEMORY:
-      return kOutOfMemory;
-    case OpStatus::BUSY_GROUP:
-      return "-BUSYGROUP Consumer Group name already exists";
-    case OpStatus::INVALID_NUMERIC_RESULT:
-      return kInvalidNumericResult;
-    default:
-      LOG(ERROR) << "Unsupported status " << status;
-      return "Internal error";
-  }
-}
-
-void RedisReplyBuilder::SendError(OpStatus status) {
-  if (status == OpStatus::OK) {
-    SendOk();
-  } else {
-    SendError(StatusToMsg(status));
-  }
-}
-
-void RedisReplyBuilder::SendLong(long num) {
-  string str = absl::StrCat(":", num, kCRLF);
-  SendRaw(str);
-}
-
-void RedisReplyBuilder::SendScoredArray(const std::vector<std::pair<std::string, double>>& arr,
-                                        bool with_scores) {
-  ReplyAggregator agg(this);
-  if (!with_scores) {
-    StartArray(arr.size());
-    for (const auto& p : arr) {
-      SendBulkString(p.first);
-    }
-    return;
-  }
-  if (!is_resp3_) {  // RESP2 formats withscores as a flat array.
-    StartArray(arr.size() * 2);
-    for (const auto& p : arr) {
-      SendBulkString(p.first);
-      SendDouble(p.second);
-    }
-    return;
-  }
-  // Resp3 formats withscores as array of (key, score) pairs.
-  StartArray(arr.size());
-  for (const auto& p : arr) {
-    StartArray(2);
-    SendBulkString(p.first);
-    SendDouble(p.second);
-  }
-}
-
-void RedisReplyBuilder::SendDouble(double val) {
-  char buf[64];
-
-  StringBuilder sb(buf, sizeof(buf));
-  CHECK(dfly_conv.ToShortest(val, &sb));
-
-  if (!is_resp3_) {
-    SendBulkString(sb.Finalize());
-  } else {
-    // RESP3
-    string str = absl::StrCat(",", sb.Finalize(), kCRLF);
-    SendRaw(str);
-  }
-}
-
-void RedisReplyBuilder::SendMGetResponse(absl::Span<const OptResp> arr) {
-  string res = absl::StrCat("*", arr.size(), kCRLF);
-  for (size_t i = 0; i < arr.size(); ++i) {
-    if (arr[i]) {
-      StrAppend(&res, "$", arr[i]->value.size(), kCRLF);
-      res.append(arr[i]->value).append(kCRLF);
-    } else {
-      res.append(NullString());
-    }
-  }
-
-  SendRaw(res);
-}
-
-void RedisReplyBuilder::SendSimpleStrArr(StrSpan arr) {
-  WrappedStrSpan warr{arr};
-
-  string res = absl::StrCat("*", warr.Size(), kCRLF);
-
-  for (unsigned i = 0; i < warr.Size(); i++)
-    StrAppend(&res, "+", warr[i], kCRLF);
-
-  SendRaw(res);
-}
-
-void RedisReplyBuilder::SendNullArray() {
-  SendRaw("*-1\r\n");
+void RedisReplyBuilder::StartArray(unsigned len) {
+  StartCollection(len, CollectionType::ARRAY);
 }
 
 void RedisReplyBuilder::SendEmptyArray() {
   StartArray(0);
-}
-
-void RedisReplyBuilder::SendStringArr(StrSpan arr, CollectionType type) {
-  WrappedStrSpan warr{arr};
-
-  if (type == ARRAY && warr.Size() == 0) {
-    SendRaw("*0\r\n");
-    return;
-  }
-
-  SendStringArrInternal(warr, type);
-}
-
-void RedisReplyBuilder::StartArray(unsigned len) {
-  StartCollection(len, ARRAY);
-}
-
-constexpr static string_view START_SYMBOLS[] = {"*", "~", "%", ">"};
-static_assert(START_SYMBOLS[RedisReplyBuilder::MAP] == "%" &&
-              START_SYMBOLS[RedisReplyBuilder::SET] == "~");
-
-void RedisReplyBuilder::StartCollection(unsigned len, CollectionType type) {
-  if (!is_resp3_) {  // Flatten for Resp2
-    if (type == MAP)
-      len *= 2;
-    type = ARRAY;
-  }
-
-  // We do not want to send multiple packets for small responses because these
-  // trigger TCP-related artifacts (e.g. Nagle's algorithm) that slow down the delivery of the whole
-  // response.
-  bool prev = should_aggregate_;
-  should_aggregate_ |= (len > 0);
-  SendRaw(absl::StrCat(START_SYMBOLS[type], len, kCRLF));
-  should_aggregate_ = prev;
-}
-
-// This implementation a bit complicated because it uses vectorized
-// send to send an array. The problem with that is the OS limits vector length
-// to low numbers (around 1024). Therefore, to make it robust we send the array in batches.
-// We limit the vector length to 256 and when it fills up we flush it to the socket and continue
-// iterating.
-void RedisReplyBuilder::SendStringArrInternal(WrappedStrSpan arr, CollectionType type) {
-  size_t size = arr.Size();
-
-  size_t header_len = size;
-  string_view type_char = "*";
-  if (is_resp3_) {
-    type_char = START_SYMBOLS[type];
-    if (type == MAP)
-      header_len /= 2;  // Each key value pair counts as one.
-  }
-
-  if (header_len == 0) {
-    SendRaw(absl::StrCat(type_char, "0\r\n"));
-    return;
-  }
-
-  // When vector length is too long, Send returns EMSGSIZE.
-  size_t vec_len = std::min<size_t>(256u, size);
-
-  absl::FixedArray<iovec, 16> vec(vec_len * 2 + 2);
-  absl::FixedArray<char, 64> meta((vec_len + 1) * 16);
-  char* next = meta.data();
-
-  *next++ = type_char[0];
-  next = absl::numbers_internal::FastIntToBuffer(header_len, next);
-  *next++ = '\r';
-  *next++ = '\n';
-  vec[0] = IoVec(string_view{meta.data(), size_t(next - meta.data())});
-  char* start = next;
-
-  unsigned vec_indx = 1;
-  string_view src;
-  for (unsigned i = 0; i < size; ++i) {
-    src = arr[i];
-    *next++ = '$';
-    next = absl::numbers_internal::FastIntToBuffer(src.size(), next);
-    *next++ = '\r';
-    *next++ = '\n';
-    vec[vec_indx] = IoVec(string_view{start, size_t(next - start)});
-    DCHECK_GT(next - start, 0);
-
-    start = next;
-    ++vec_indx;
-
-    vec[vec_indx] = IoVec(src);
-
-    *next++ = '\r';
-    *next++ = '\n';
-    ++vec_indx;
-
-    if (vec_indx + 1 >= vec.size()) {
-      if (i < size - 1 || vec_indx == vec.size()) {
-        Send(vec.data(), vec_indx);
-        if (ec_)
-          return;
-
-        vec_indx = 0;
-        start = meta.data();
-        next = start + 2;
-        start[0] = '\r';
-        start[1] = '\n';
-      }
-    }
-  }
-
-  vec[vec_indx].iov_base = start;
-  vec[vec_indx].iov_len = 2;
-  Send(vec.data(), vec_indx + 1);
-}
-
-void ReqSerializer::SendCommand(std::string_view str) {
-  VLOG(2) << "SendCommand: " << str;
-
-  iovec v[] = {IoVec(str), IoVec(kCRLF)};
-  ec_ = sink_->Write(v, ABSL_ARRAYSIZE(v));
 }
 
 }  // namespace facade

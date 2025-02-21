@@ -17,19 +17,25 @@ namespace dfly {
 
 /**
  * @brief Tightly coupled with mi_malloc 2.x implementation.
- *        Fetches 8MB segment pointers from the allocated pointers.
+ *        Fetches 32MiB segment pointers from the allocated pointers.
  *        Provides own indexing of small pointers to real address space using the segment ptrs/
  */
 
 class SegmentAllocator {
-  static constexpr uint32_t kSegmentIdBits = 12;
-  static constexpr uint32_t kSegmentIdMask = (1 << kSegmentIdBits) - 1;
-  static constexpr uint64_t kSegmentAlignMask = ~((1 << 23) - 1);
+  // (2 ^ 10) total segments
+  static constexpr uint32_t kSegmentIdBits = 10;
+  static constexpr uint32_t kSegmentIdMask = (1u << kSegmentIdBits) - 1;
+  // (2 ^ 25) total bytes per segment = 32MiB
+  static constexpr uint32_t kSegmentShift = 25;
+
+  // Segment range that we cover within a single segment.
+  static constexpr uint64_t kSegmentAlignMask = ~((1ULL << kSegmentShift) - 1);
 
  public:
   using Ptr = uint32_t;
 
   SegmentAllocator(mi_heap_t* heap);
+  bool CanAllocate();
 
   uint8_t* Translate(Ptr p) const {
     return address_table_[p & kSegmentIdMask] + Offset(p);

@@ -13,48 +13,113 @@ jobs:
     # cross-platform coverage.
     # See: https://docs.github.com/en/free-pro-team@latest/actions/learn-github-actions/managing-complex-workflows#using-a-build-matrix
     runs-on: ubuntu-latest
-    name: Build with ${{ matrix.flags }} flags
+    name: Build ${{ matrix.name }}
     strategy:
       matrix:
-        # Build with these flags
-        flags: ["-DMARCH_OPT=-march=x86-64"]
-    timeout-minutes: 30
+        include:
+          # Build with these flags
+          - name: generic
+            container: alpine-dev
+            flags: "-DMARCH_OPT=-march=x86-64"
+          - name: fedora
+            container: fedora:30
+
+    timeout-minutes: 45
 
     container:
-      image: ghcr.io/romange/alpine-dev:latest
+      image: ghcr.io/romange/${{ matrix.container }}
+      options: --security-opt seccomp=unconfined
       credentials:
         username: ${{ github.repository_owner }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: true
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.7
+
+      - name: Configure Cache Env
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '')
+
       - name: Install dependencies
         run: |
-          uname -a
           cmake --version
-          mkdir -p ${{github.workspace}}/build
-      - name: Cache build deps
-        id: cache-deps
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.ccache
-            ${{github.workspace}}/build/_deps
-          key: ${{ runner.os }}-deps-${{ github.base_ref }}-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-deps-${{ github.base_ref }}-
+          mkdir -p $GITHUB_WORKSPACE/build
+      - name: Install packages
+        if: matrix.container == 'fedora:30'
+        run: |
+          echo Passed
 
-      - name: Configure CMake
-        # Configure CMake in a 'build' subdirectory. `CMAKE_BUILD_TYPE` is only required if you are using a single-configuration generator such as make.
-        # See https://cmake.org/cmake/help/latest/variable/CMAKE_BUILD_TYPE.html?highlight=cmake_build_type
+      - name: Configure & Build
         run: |
-          cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=Debug -GNinja -DCMAKE_CXX_COMPILER_LAUNCHER=ccache ${{ matrix.flags }}
-          cd ${{github.workspace}}/build && pwd
-          du -hcs _deps/
-      - name: Build
-        run: |
-          cd ${{github.workspace}}/build
+          cd $GITHUB_WORKSPACE/build
+          cmake .. -DCMAKE_BUILD_TYPE=Debug -GNinja -DCMAKE_CXX_COMPILER_LAUNCHER=sccache -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+             ${{ matrix.flags }}
           ninja src/all
-          ccache --show-stats
+      - name: Test
+        run: |
+            cd $GITHUB_WORKSPACE/build
+            ctest -V -L DFLY
+
+  build-macos:
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.7
+
+      - name: Configure Cache Env
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '')
+
+      - name: Install dependencies
+        run: |
+
+          # Remove Python3 symlinks in /usr/local/bin as workaround to brew update issues
+          # https://github.com/actions/setup-python/issues/577
+          rm /usr/local/bin/2to3* || :
+          rm /usr/local/bin/idle3* || :
+          rm /usr/local/bin/pydoc* || :
+          rm /usr/local/bin/python3* || :
+          brew update && brew install ninja boost automake zstd bison autoconf libtool
+
+          mkdir -p $GITHUB_WORKSPACE/build
+
+      - name: Configure & Build
+        run: |
+          cd $GITHUB_WORKSPACE/build
+
+          export PATH=/opt/homebrew/bin:$PATH
+          export PATH=/opt/homebrew/opt/bison/bin/:$PATH
+
+          which bison
+          bison --version
+
+          gcc-12 --version
+
+          autoconf --help
+          autoreconf --help
+
+          echo "*************************** START BUILDING **************************************"
+          CC=gcc-12 CXX=g++-12 cmake .. -DCMAKE_BUILD_TYPE=Debug -GNinja -DWITH_UNWIND=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_FLAGS="-Wl,-ld_classic" \
+            -DCMAKE_C_COMPILER="gcc-12" -DCMAKE_CXX_COMPILER="g++-12"
+
+          ninja src/all
+
+      - name: Test
+        run: |
+            cd $GITHUB_WORKSPACE/build
+            ctest -V -L DFLY

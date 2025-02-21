@@ -17,13 +17,14 @@ Kubernetes: `>=1.23.0-0`
 
 ## Installing from a pre-packaged OCI
 
-Pick a version from https://github.com/dragonflydb/dragonfly/pkgs/container/dragonfly/helm/dragonfly
+Pick a version from https://github.com/dragonflydb/dragonfly/pkgs/container/dragonfly%2Fhelm%2Fdragonfly
 
+Example:
 
-E.g. VERSION=v0.15.0
-
+```shell
+VERSION=v1.12.1
 helm upgrade --install dragonfly oci://ghcr.io/dragonflydb/dragonfly/helm/dragonfly --version $VERSION
-
+```
 
 ## Values
 
@@ -65,6 +66,8 @@ helm upgrade --install dragonfly oci://ghcr.io/dragonflydb/dragonfly/helm/dragon
 | replicaCount | int | `1` | Number of replicas to deploy |
 | resources.limits | object | `{}` | The resource limits for the containers |
 | resources.requests | object | `{}` | The requested resources for the containers |
+| env | list | `[]` | Extra environment variables |
+| envFrom | list | `[]` | Extra environment variables from K8s objects |
 | securityContext | object | `{}` | Set securityContext for containers |
 | service.annotations | object | `{}` | Extra annotations for the service |
 | service.lablels | object | `{}` | Extra labels for the service |

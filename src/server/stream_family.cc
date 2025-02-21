@@ -7,23 +7,37 @@
 #include <absl/strings/str_cat.h>
 
 extern "C" {
-#include "redis/object.h"
 #include "redis/stream.h"
+#include "redis/zmalloc.h"
 }
 
 #include "base/logging.h"
-#include "facade/error.h"
+#include "facade/cmd_arg_parser.h"
+#include "server/acl/acl_commands_def.h"
 #include "server/blocking_controller.h"
 #include "server/command_registry.h"
 #include "server/conn_context.h"
 #include "server/engine_shard_set.h"
-#include "server/server_state.h"
+#include "server/error.h"
+#include "server/family_utils.h"
 #include "server/transaction.h"
 
 namespace dfly {
 
 using namespace facade;
 using namespace std;
+
+StreamMemTracker::StreamMemTracker() {
+  start_size_ = zmalloc_used_memory_tl;
+}
+
+void StreamMemTracker::UpdateStreamSize(PrimeValue& pv) const {
+  const size_t current = zmalloc_used_memory_tl;
+  int64_t diff = static_cast<int64_t>(current) - static_cast<int64_t>(start_size_);
+  pv.AddStreamSize(diff);
+  // Under any flow we must not end up with this special value.
+  DCHECK(pv.MallocUsed() != 0);
+}
 
 namespace {
 
@@ -33,6 +47,14 @@ struct Record {
 };
 
 using RecordVec = vector<Record>;
+
+using nonstd::make_unexpected;
+
+template <typename T> using ParseResult = io::Result<T, ErrorReply>;
+
+nonstd::unexpected_type<ErrorReply> CreateSyntaxError(std::string_view message) {
+  return make_unexpected(ErrorReply{message, kSyntaxErrType});
+}
 
 struct ParsedStreamId {
   streamID val;
@@ -44,7 +66,7 @@ struct ParsedStreamId {
 
   // Whether to lookup messages after the last ID in the stream. Used for XREAD
   // when using ID '$'.
-  bool last_id = false;
+  bool resolve_last_id = false;
 };
 
 struct RangeId {
@@ -52,23 +74,63 @@ struct RangeId {
   bool exclude = false;
 };
 
-enum class TrimStrategy {
-  kNone = TRIM_STRATEGY_NONE,
-  kMaxLen = TRIM_STRATEGY_MAXLEN,
-  kMinId = TRIM_STRATEGY_MINID,
+struct TrimOpts {
+  static constexpr int32_t kNoTrimLimit = -1;
+
+  bool HasLimit() const {
+    return limit != kNoTrimLimit;
+  }
+
+  bool IsMaxLen() const {
+    return std::holds_alternative<uint32_t>(length_or_id);
+  }
+
+  uint32_t AsMaxLen() const {
+    return std::get<uint32_t>(length_or_id);
+  }
+
+  const ParsedStreamId& AsMinId() const {
+    return std::get<ParsedStreamId>(length_or_id);
+  }
+
+  // First is MaxLen, second is MinId.
+  std::variant<uint32_t, ParsedStreamId> length_or_id;
+  int32_t limit = kNoTrimLimit;
+  bool approx = false;
 };
 
-struct AddTrimOpts {
-  string_view key;
-  ParsedStreamId minid;
-  uint32_t max_len = kuint32max;
-  uint32_t limit = 0;
-  TrimStrategy trim_strategy = TrimStrategy::kNone;
-  bool trim_approx = false;
-
-  // XADD only.
+struct AddOpts {
+  std::optional<TrimOpts> trim_opts;
   ParsedStreamId parsed_id;
   bool no_mkstream = false;
+};
+
+/* Used to journal the XADD command.
+   The actual stream ID assigned after adding may differ from the one specified in the command.
+   So, for the replica, we need to specify the exact ID that was actually added. */
+struct AddArgsJournaler {
+  void SetStreamId(std::string_view stream_id) {
+    add_args[stream_id_index] = stream_id;
+  }
+
+  CmdArgVec add_args;
+  size_t stream_id_index;
+};
+
+struct NACKInfo {
+  streamID pel_id;
+  string consumer_name;
+  size_t delivery_time;
+  size_t delivery_count;
+};
+
+struct ConsumerInfo {
+  string name;
+  mstime_t seen_time;
+  mstime_t active_time;
+  size_t pel_count;
+  vector<NACKInfo> pending;
+  size_t idle;
 };
 
 struct GroupInfo {
@@ -76,6 +138,27 @@ struct GroupInfo {
   size_t consumer_size;
   size_t pending_size;
   streamID last_id;
+  int64_t entries_read;
+  int64_t lag;
+  vector<NACKInfo> stream_nack_vec;
+  vector<ConsumerInfo> consumer_info_vec;
+};
+
+using GroupInfoVec = vector<GroupInfo>;
+
+struct StreamInfo {
+  size_t length;
+  size_t radix_tree_keys;
+  size_t radix_tree_nodes;
+  size_t groups;
+  streamID recorded_first_entry_id;
+  streamID last_generated_id;
+  streamID max_deleted_entry_id;
+  size_t entries_added;
+  Record first_entry;
+  Record last_entry;
+  vector<Record> entries;
+  GroupInfoVec cgroups;
 };
 
 struct RangeOpts {
@@ -115,6 +198,8 @@ struct ReadOpts {
   bool noack = false;
 };
 
+const char kTrimOptionConflictErr[] =
+    "MAXLEN and MINID options at the same time are not compatible";
 const char kInvalidStreamId[] = "Invalid stream ID specified as stream command argument";
 const char kXGroupKeyNotFound[] =
     "The XGROUP subcommand requires the key to exist. "
@@ -130,16 +215,25 @@ const uint32_t STREAM_LISTPACK_MAX_PRE_ALLOCATE = 4096;
 /* Every stream item inside the listpack, has a flags field that is used to
  * mark the entry as deleted, or having the same field as the "master"
  * entry at the start of the listpack. */
-const uint32_t STREAM_ITEM_FLAG_NONE = 0;              /* No special flags. */
-const uint32_t STREAM_ITEM_FLAG_DELETED = (1 << 0);    /* Entry is deleted. Skip it. */
+// const uint32_t STREAM_ITEM_FLAG_DELETED = (1 << 0);    /* Entry is deleted. Skip it. */
 const uint32_t STREAM_ITEM_FLAG_SAMEFIELDS = (1 << 1); /* Same fields as master entry. */
 
-inline string StreamIdRepr(const streamID& id) {
+string StreamIdRepr(const streamID& id) {
   return absl::StrCat(id.ms, "-", id.seq);
 };
 
-inline string NoGroupError(string_view key, string_view cgroup) {
+string NoGroupError(string_view key, string_view cgroup) {
   return absl::StrCat("-NOGROUP No such consumer group '", cgroup, "' for key name '", key, "'");
+}
+
+string NoGroupOrKey(string_view key, string_view cgroup, string_view suffix = "") {
+  return absl::StrCat("-NOGROUP No such key '", key, "'", " or consumer group '", cgroup, "'",
+                      suffix);
+}
+
+string LeqTopIdError(string_view cmd_name) {
+  return absl::StrCat("The ID specified in ", cmd_name,
+                      " is equal or smaller than the target stream top item");
 }
 
 inline const uint8_t* SafePtr(MutableSlice field) {
@@ -197,15 +291,16 @@ bool ParseID(string_view strid, bool strict, uint64_t missing_seq, ParsedStreamI
   return true;
 }
 
-bool ParseRangeId(string_view id, RangeId* dest) {
+enum class RangeBoundary { kStart, kEnd };
+bool ParseRangeId(string_view id, RangeBoundary type, RangeId* dest) {
   if (id.empty())
     return false;
   if (id[0] == '(') {
     dest->exclude = true;
     id.remove_prefix(1);
   }
-
-  return ParseID(id, dest->exclude, 0, &dest->parsed_id);
+  uint64 missing_seq = type == RangeBoundary::kStart ? 0 : -1;
+  return ParseID(id, dest->exclude, missing_seq, &dest->parsed_id);
 }
 
 /* This is a wrapper function for lpGet() to directly get an integer value
@@ -243,10 +338,9 @@ int64_t lpGetInteger(unsigned char* ele) {
  * milliseconds Unix time is greater than the previous one, just use this
  * as time part and start with sequence part of zero. Otherwise we use the
  * previous time (and never go backward) and increment the sequence. */
-void StreamNextID(const streamID* last_id, streamID* new_id) {
-  uint64_t ms = mstime();
-  if (ms > last_id->ms) {
-    new_id->ms = ms;
+void StreamNextID(uint64_t now_ms, const streamID* last_id, streamID* new_id) {
+  if (now_ms > last_id->ms) {
+    new_id->ms = now_ms;
     new_id->seq = 0;
   } else {
     *new_id = *last_id;
@@ -273,15 +367,15 @@ inline void StreamEncodeID(uint8_t* buf, streamID* id) {
  * part of the passed ID is ignored and the function will attempt to use an
  * auto-generated sequence.
  *
- * The function returns C_OK if the item was added, this is always true
+ * The function returns 0 if the item was added, this is always true
  * if the ID was generated by the function. However the function may return
- * C_ERR in several cases:
+ * errors in several cases:
  * 1. If an ID was given via 'use_id', but adding it failed since the
- *    current top ID is greater or equal. errno will be set to EDOM.
+ *    current top ID is greater or equal, it returns EDOM.
  * 2. If a size of a single element or the sum of the elements is too big to
- *    be stored into the stream. errno will be set to ERANGE. */
-int StreamAppendItem(stream* s, CmdArgList fields, streamID* added_id, streamID* use_id,
-                     int seq_given) {
+ *    be stored into the stream. it returns ERANGE. */
+int StreamAppendItem(stream* s, CmdArgList fields, uint64_t now_ms, streamID* added_id,
+                     streamID* use_id, int seq_given) {
   /* Generate the new entry ID. */
   streamID id;
   if (use_id) {
@@ -294,7 +388,7 @@ int StreamAppendItem(stream* s, CmdArgList fields, streamID* added_id, streamID*
        * in time. */
       if (s->last_id.ms == use_id->ms) {
         if (s->last_id.seq == UINT64_MAX) {
-          return C_ERR;
+          return EDOM;
         }
         id = s->last_id;
         id.seq++;
@@ -303,7 +397,7 @@ int StreamAppendItem(stream* s, CmdArgList fields, streamID* added_id, streamID*
       }
     }
   } else {
-    StreamNextID(&s->last_id, &id);
+    StreamNextID(now_ms, &s->last_id, &id);
   }
 
   /* Check that the new ID is greater than the last entry ID
@@ -311,12 +405,11 @@ int StreamAppendItem(stream* s, CmdArgList fields, streamID* added_id, streamID*
    * overflow (and wrap-around) when incrementing the sequence
      part. */
   if (streamCompareID(&id, &s->last_id) <= 0) {
-    errno = EDOM;
-    return C_ERR;
+    return EDOM;
   }
 
   /* Avoid overflow when trying to add an element to the stream (listpack
-   * can only host up to 32bit length sttrings, and also a total listpack size
+   * can only host up to 32bit length strings, and also a total listpack size
    * can't be bigger than 32bit length. */
   size_t totelelen = 0;
   for (size_t i = 0; i < fields.size(); i++) {
@@ -324,8 +417,7 @@ int StreamAppendItem(stream* s, CmdArgList fields, streamID* added_id, streamID*
   }
 
   if (totelelen > STREAM_LISTPACK_MAX_SIZE) {
-    errno = ERANGE;
-    return C_ERR;
+    return ERANGE;
   }
 
   /* Add the new entry. */
@@ -385,22 +477,27 @@ int StreamAppendItem(stream* s, CmdArgList fields, streamID* added_id, streamID*
    * if we need to switch to the next one. 'lp' will be set to NULL if
    * the current node is full. */
   if (lp != NULL) {
+    int new_node = 0;
     size_t node_max_bytes = kStreamNodeMaxBytes;
     if (node_max_bytes == 0 || node_max_bytes > STREAM_LISTPACK_MAX_SIZE)
       node_max_bytes = STREAM_LISTPACK_MAX_SIZE;
     if (lp_bytes + totelelen >= node_max_bytes) {
-      lp = NULL;
+      new_node = 1;
     } else if (kStreamNodeMaxEntries) {
       unsigned char* lp_ele = lpFirst(lp);
       /* Count both live entries and deleted ones. */
       int64_t count = lpGetInteger(lp_ele) + lpGetInteger(lpNext(lp, lp_ele));
       if (count >= kStreamNodeMaxEntries) {
-        /* Shrink extra pre-allocated memory */
-        lp = lpShrinkToFit(lp);
-        if (ri.data != lp)
-          raxInsert(s->rax_tree, ri.key, ri.key_len, lp, NULL);
-        lp = NULL;
+        new_node = 1;
       }
+    }
+
+    if (new_node) {
+      /* Shrink extra pre-allocated memory */
+      lp = lpShrinkToFit(lp);
+      if (ri.data != lp)
+        raxInsert(s->rax_tree, ri.key, ri.key_len, lp, NULL);
+      lp = NULL;
     }
   }
 
@@ -521,67 +618,81 @@ int StreamAppendItem(stream* s, CmdArgList fields, streamID* added_id, streamID*
     s->first_id = id;
   if (added_id)
     *added_id = id;
-  return C_OK;
-}
-
-int StreamTrim(const AddTrimOpts& opts, stream* s) {
-  if (!opts.limit) {
-    if (opts.trim_strategy == TrimStrategy::kMaxLen) {
-      /* Notify xtrim event if needed. */
-      return streamTrimByLength(s, opts.max_len, opts.trim_approx);
-      // TODO: when replicating, we should propagate it as exact limit in case of trimming.
-    } else if (opts.trim_strategy == TrimStrategy::kMinId) {
-      return streamTrimByID(s, opts.minid.val, opts.trim_approx);
-    }
-  } else {
-    streamAddTrimArgs trim_args = {};
-    trim_args.trim_strategy = static_cast<int>(opts.trim_strategy);
-    trim_args.approx_trim = opts.trim_approx;
-    trim_args.limit = opts.limit;
-
-    if (opts.trim_strategy == TrimStrategy::kMaxLen) {
-      trim_args.maxlen = opts.max_len;
-    } else if (opts.trim_strategy == TrimStrategy::kMinId) {
-      trim_args.minid = opts.minid.val;
-    }
-    return streamTrim(s, &trim_args);
-  }
 
   return 0;
 }
 
-OpResult<streamID> OpAdd(const OpArgs& op_args, const AddTrimOpts& opts, CmdArgList args) {
-  DCHECK(!args.empty() && args.size() % 2 == 0);
-  auto& db_slice = op_args.shard->db_slice();
-  pair<PrimeIterator, bool> add_res;
+/* Create a NACK entry setting the delivery count to 1 and the delivery
+ * time to the current time or test-hooked time. The NACK consumer will be
+ * set to the one specified as argument of the function. */
+streamNACK* StreamCreateNACK(streamConsumer* consumer, uint64_t now_ms) {
+  streamNACK* nack = reinterpret_cast<streamNACK*>(zmalloc(sizeof(*nack)));
+  nack->delivery_time = now_ms;
+  nack->delivery_count = 1;
+  nack->consumer = consumer;
+  return nack;
+}
 
-  if (opts.no_mkstream) {
-    auto res_it = db_slice.Find(op_args.db_cntx, opts.key, OBJ_STREAM);
-    if (!res_it) {
-      return res_it.status();
-    }
-    add_res.first = res_it.value();
-    add_res.second = false;
-  } else {
-    try {
-      add_res = db_slice.AddOrFind(op_args.db_cntx, opts.key);
-    } catch (bad_alloc&) {
-      return OpStatus::OUT_OF_MEMORY;
+std::string StreamsIdToString(streamID id) {
+  return absl::StrCat(id.ms, "-", id.seq);
+}
+
+/* Return value represents the number of deleted items. */
+int64_t TrimStream(const TrimOpts& opts, stream* s) {
+  if (!opts.HasLimit()) {
+    if (opts.IsMaxLen()) {
+      return streamTrimByLength(s, opts.AsMaxLen(), opts.approx);
+    } else {
+      const auto& min_id = opts.AsMinId().val;
+      return streamTrimByID(s, min_id, opts.approx);
     }
   }
 
-  robj* stream_obj = nullptr;
-  PrimeIterator& it = add_res.first;
+  streamAddTrimArgs trim_args = {};
+  trim_args.approx_trim = opts.approx;
+  trim_args.limit = opts.limit;
 
-  if (add_res.second) {  // new key
-    stream_obj = createStreamObject();
-
-    it->second.ImportRObj(stream_obj);
+  if (opts.IsMaxLen()) {
+    trim_args.trim_strategy = TRIM_STRATEGY_MAXLEN;
+    trim_args.maxlen = opts.AsMaxLen();
   } else {
-    if (it->second.ObjType() != OBJ_STREAM)
-      return OpStatus::WRONG_TYPE;
+    trim_args.trim_strategy = TRIM_STRATEGY_MINID;
+    trim_args.minid = opts.AsMinId().val;
+  }
 
-    db_slice.PreUpdate(op_args.db_cntx.db_index, it);
+  return streamTrim(s, &trim_args);
+}
+
+bool JournalAsMinId(const TrimOpts& opts) {
+  return opts.approx || opts.IsMaxLen();
+}
+
+OpResult<streamID> OpAdd(const OpArgs& op_args, string_view key, const AddOpts& opts,
+                         CmdArgList args, AddArgsJournaler journaler) {
+  DCHECK(!args.empty() && args.size() % 2 == 0);
+
+  auto& db_slice = op_args.GetDbSlice();
+
+  DbSlice::AddOrFindResult add_res;
+  if (opts.no_mkstream) {
+    auto res_it = db_slice.FindMutable(op_args.db_cntx, key, OBJ_STREAM);
+    RETURN_ON_BAD_STATUS(res_it);
+    add_res = std::move(*res_it);
+  } else {
+    auto op_res = db_slice.AddOrFind(op_args.db_cntx, key);
+    RETURN_ON_BAD_STATUS(op_res);
+    add_res = std::move(*op_res);
+  }
+
+  auto& it = add_res.it;
+
+  StreamMemTracker mem_tracker;
+
+  if (add_res.is_new) {
+    stream* s = streamNew();
+    it->second.InitRobj(OBJ_STREAM, OBJ_ENCODING_STREAM, s);
+  } else if (it->second.ObjType() != OBJ_STREAM) {
+    return OpStatus::WRONG_TYPE;
   }
 
   stream* stream_inst = (stream*)it->second.RObjPtr();
@@ -589,31 +700,76 @@ OpResult<streamID> OpAdd(const OpArgs& op_args, const AddTrimOpts& opts, CmdArgL
   streamID result_id;
   const auto& parsed_id = opts.parsed_id;
   streamID passed_id = parsed_id.val;
-  int res = StreamAppendItem(stream_inst, args, &result_id,
+  int res = StreamAppendItem(stream_inst, args, op_args.db_cntx.time_now_ms, &result_id,
                              parsed_id.id_given ? &passed_id : nullptr, parsed_id.has_seq);
 
-  if (res != C_OK) {
-    if (errno == ERANGE)
+  if (res != 0) {
+    if (res == ERANGE)
       return OpStatus::OUT_OF_RANGE;
-    if (errno == EDOM)
+    if (res == EDOM)
       return OpStatus::STREAM_ID_SMALL;
 
     return OpStatus::OUT_OF_MEMORY;
   }
 
-  StreamTrim(opts, stream_inst);
+  if (opts.trim_opts) {
+    int64_t deleted_items_number = TrimStream(opts.trim_opts.value(), stream_inst);
+    VLOG(2) << "Trimmed " << deleted_items_number << " items from stream " << key
+            << " during the XADD command";
+  }
 
-  EngineShard* es = op_args.shard;
-  if (es->blocking_controller()) {
-    es->blocking_controller()->AwakeWatched(op_args.db_cntx.db_index, opts.key);
+  mem_tracker.UpdateStreamSize(it->second);
+
+  if (op_args.shard->journal()) {
+    std::string result_id_as_string = StreamsIdToString(result_id);
+    const bool stream_is_empty = stream_inst->length == 0;
+
+    if (opts.trim_opts && (stream_is_empty || JournalAsMinId(opts.trim_opts.value()))) {
+      std::string last_id;
+
+      CmdArgVec journal_args = {key};
+      journal_args.reserve(args.size() + 4);
+
+      if (stream_is_empty) {
+        // We need remove the whole stream in replica
+        journal_args.emplace_back("MAXLEN"sv);
+        journal_args.emplace_back("0"sv);
+      } else {
+        // We need to set exact MinId in the journal.
+        // For this we are using new first_id from the stream
+        last_id = StreamsIdToString(stream_inst->first_id);
+        journal_args.emplace_back("MINID"sv);
+        journal_args.emplace_back(last_id);
+      }
+
+      if (opts.no_mkstream) {
+        journal_args.emplace_back("NOMKSTREAM"sv);
+      }
+
+      journal_args.emplace_back(result_id_as_string);
+
+      for (size_t i = 0; i < args.size(); i++) {
+        journal_args.emplace_back(args[i]);
+      }
+
+      RecordJournal(op_args, "XADD"sv, journal_args);
+    } else {
+      journaler.SetStreamId(result_id_as_string);
+      RecordJournal(op_args, "XADD"sv, journaler.add_args);
+    }
+  }
+
+  auto blocking_controller = op_args.db_cntx.ns->GetBlockingController(op_args.shard->shard_id());
+  if (blocking_controller) {
+    blocking_controller->AwakeWatched(op_args.db_cntx.db_index, key);
   }
 
   return result_id;
 }
 
 OpResult<RecordVec> OpRange(const OpArgs& op_args, string_view key, const RangeOpts& opts) {
-  auto& db_slice = op_args.shard->db_slice();
-  OpResult<PrimeIterator> res_it = db_slice.Find(op_args.db_cntx, key, OBJ_STREAM);
+  auto& db_slice = op_args.GetDbSlice();
+  auto res_it = db_slice.FindReadOnly(op_args.db_cntx, key, OBJ_STREAM);
   if (!res_it)
     return res_it.status();
 
@@ -625,7 +781,7 @@ OpResult<RecordVec> OpRange(const OpArgs& op_args, string_view key, const RangeO
   streamIterator si;
   int64_t numfields;
   streamID id;
-  CompactObj& cobj = (*res_it)->second;
+  const CompactObj& cobj = (*res_it)->second;
   stream* s = (stream*)cobj.RObjPtr();
   streamID sstart = opts.start.val, send = opts.end.val;
 
@@ -635,6 +791,16 @@ OpResult<RecordVec> OpRange(const OpArgs& op_args, string_view key, const RangeO
     rec.id = id;
     rec.kv_arr.reserve(numfields);
     if (opts.group && streamCompareID(&id, &opts.group->last_id) > 0) {
+      if (opts.group->entries_read != SCG_INVALID_ENTRIES_READ &&
+          !streamRangeHasTombstones(s, &id, NULL)) {
+        /* A valid counter and no future tombstones mean we can
+         * increment the read counter to keep tracking the group's
+         * progress. */
+        opts.group->entries_read++;
+      } else if (s->entries_added) {
+        /* The group's counter may be invalid, so we try to obtain it. */
+        opts.group->entries_read = streamEstimateDistanceFromFirstEverEntry(s, &id);
+      }
       opts.group->last_id = id;
     }
 
@@ -654,12 +820,14 @@ OpResult<RecordVec> OpRange(const OpArgs& op_args, string_view key, const RangeO
     if (opts.group && !opts.noack) {
       unsigned char buf[sizeof(streamID)];
       StreamEncodeID(buf, &id);
+      uint64_t now_ms = op_args.db_cntx.time_now_ms;
 
       /* Try to add a new NACK. Most of the time this will work and
        * will not require extra lookups. We'll fix the problem later
        * if we find that there is already an entry for this ID. */
-      streamNACK* nack = streamCreateNACK(opts.consumer);
+      streamNACK* nack = StreamCreateNACK(opts.consumer, now_ms);
       int group_inserted = raxTryInsert(opts.group->pel, buf, sizeof(buf), nack, nullptr);
+
       int consumer_inserted = raxTryInsert(opts.consumer->pel, buf, sizeof(buf), nack, nullptr);
 
       /* Now we can check if the entry was already busy, and
@@ -670,15 +838,19 @@ OpResult<RecordVec> OpRange(const OpArgs& op_args, string_view key, const RangeO
         nack = static_cast<streamNACK*>(raxFind(opts.group->pel, buf, sizeof(buf)));
         DCHECK(nack != raxNotFound);
         raxRemove(nack->consumer->pel, buf, sizeof(buf), NULL);
+        LOG_IF(DFATAL, nack->consumer->pel->numnodes == 0) << "Invalid rax state";
+
         /* Update the consumer and NACK metadata. */
         nack->consumer = opts.consumer;
-        nack->delivery_time = mstime();
+        nack->delivery_time = now_ms;
         nack->delivery_count = 1;
         /* Add the entry in the new consumer local PEL. */
         raxInsert(opts.consumer->pel, buf, sizeof(buf), nack, NULL);
       } else if (group_inserted == 1 && consumer_inserted == 0) {
+        LOG(DFATAL) << "Internal error";
         return OpStatus::SKIPPED;  // ("NACK half-created. Should not be possible.");
       }
+      opts.consumer->active_time = now_ms;
     }
     if (opts.count == result.size())
       break;
@@ -722,7 +894,7 @@ OpResult<RecordVec> OpRangeFromConsumerPEL(const OpArgs& op_args, string_view ke
       result.push_back(Record{id, vector<pair<string, string>>()});
     } else {
       streamNACK* nack = static_cast<streamNACK*>(ri.data);
-      nack->delivery_time = mstime();
+      nack->delivery_time = op_args.db_cntx.time_now_ms;
       nack->delivery_count++;
       result.push_back(std::move(op_result.value()[0]));
     }
@@ -732,40 +904,19 @@ OpResult<RecordVec> OpRangeFromConsumerPEL(const OpArgs& op_args, string_view ke
   return result;
 }
 
-// Returns a map of stream to the ID of the last entry in the stream. Any
-// streams not found are omitted from the result.
-OpResult<vector<pair<string_view, streamID>>> OpLastIDs(const OpArgs& op_args,
-                                                        const ArgSlice& args) {
-  DCHECK(!args.empty());
-
-  auto& db_slice = op_args.shard->db_slice();
-
-  vector<pair<string_view, streamID>> last_ids;
-  for (string_view key : args) {
-    OpResult<PrimeIterator> res_it = db_slice.Find(op_args.db_cntx, key, OBJ_STREAM);
-    if (!res_it) {
-      if (res_it.status() == OpStatus::KEY_NOTFOUND) {
-        continue;
-      }
-      return res_it.status();
-    }
-
-    CompactObj& cobj = (*res_it)->second;
-    stream* s = (stream*)cobj.RObjPtr();
-
-    streamID last_id;
-    streamLastValidID(s, &last_id);
-
-    last_ids.emplace_back(key, last_id);
-  }
-
-  return last_ids;
+namespace {
+// Our C-API doesn't use const, so we have to const cast.
+// Only intended for read-only functions.
+stream* GetReadOnlyStream(const CompactObj& cobj) {
+  return const_cast<stream*>((const stream*)cobj.RObjPtr());
 }
+
+}  // namespace
 
 // Returns the range response for each stream on this shard in order of
 // GetShardArgs.
-vector<RecordVec> OpRead(const OpArgs& op_args, const ArgSlice& args, const ReadOpts& opts) {
-  DCHECK(!args.empty());
+vector<RecordVec> OpRead(const OpArgs& op_args, const ShardArgs& shard_args, const ReadOpts& opts) {
+  DCHECK(!shard_args.Empty());
 
   RangeOpts range_opts;
   range_opts.count = opts.count;
@@ -774,11 +925,11 @@ vector<RecordVec> OpRead(const OpArgs& op_args, const ArgSlice& args, const Read
                                       .seq = UINT64_MAX,
                                   }};
 
-  vector<RecordVec> response(args.size());
-  for (size_t i = 0; i < args.size(); ++i) {
-    string_view key = args[i];
-
-    auto sitem = opts.stream_ids.at(key);
+  vector<RecordVec> response(shard_args.Size());
+  unsigned index = 0;
+  for (string_view key : shard_args) {
+    const auto& sitem = opts.stream_ids.at(key);
+    auto& dest = response[index++];
     if (!sitem.group && opts.read_group) {
       continue;
     }
@@ -794,7 +945,7 @@ vector<RecordVec> OpRead(const OpArgs& op_args, const ArgSlice& args, const Read
     else
       range_res = OpRange(op_args, key, range_opts);
     if (range_res) {
-      response[i] = std::move(range_res.value());
+      dest = std::move(range_res.value());
     }
   }
 
@@ -802,24 +953,24 @@ vector<RecordVec> OpRead(const OpArgs& op_args, const ArgSlice& args, const Read
 }
 
 OpResult<uint32_t> OpLen(const OpArgs& op_args, string_view key) {
-  auto& db_slice = op_args.shard->db_slice();
-  OpResult<PrimeIterator> res_it = db_slice.Find(op_args.db_cntx, key, OBJ_STREAM);
+  auto& db_slice = op_args.GetDbSlice();
+  auto res_it = db_slice.FindReadOnly(op_args.db_cntx, key, OBJ_STREAM);
   if (!res_it)
     return res_it.status();
-  CompactObj& cobj = (*res_it)->second;
+  const CompactObj& cobj = (*res_it)->second;
   stream* s = (stream*)cobj.RObjPtr();
   return s->length;
 }
 
 OpResult<vector<GroupInfo>> OpListGroups(const DbContext& db_cntx, string_view key,
                                          EngineShard* shard) {
-  auto& db_slice = shard->db_slice();
-  OpResult<PrimeIterator> res_it = db_slice.Find(db_cntx, key, OBJ_STREAM);
+  auto& db_slice = db_cntx.GetDbSlice(shard->shard_id());
+  auto res_it = db_slice.FindReadOnly(db_cntx, key, OBJ_STREAM);
   if (!res_it)
     return res_it.status();
 
   vector<GroupInfo> result;
-  CompactObj& cobj = (*res_it)->second;
+  const CompactObj& cobj = (*res_it)->second;
   stream* s = (stream*)cobj.RObjPtr();
 
   if (s->cgroups) {
@@ -835,11 +986,213 @@ OpResult<vector<GroupInfo>> OpListGroups(const DbContext& db_cntx, string_view k
       ginfo.consumer_size = raxSize(cg->consumers);
       ginfo.pending_size = raxSize(cg->pel);
       ginfo.last_id = cg->last_id;
+      ginfo.entries_read = cg->entries_read;
+      ginfo.lag = streamCGLag(s, cg);
       result.push_back(std::move(ginfo));
     }
     raxStop(&ri);
   }
 
+  return result;
+}
+
+vector<Record> GetStreamRecords(stream* s, streamID start, streamID end, bool reverse,
+                                size_t count) {
+  streamIterator si;
+  int64_t numfields;
+  streamID id;
+  size_t arraylen = 0;
+  vector<Record> records;
+
+  streamIteratorStart(&si, s, &start, &end, reverse);
+  while (streamIteratorGetID(&si, &id, &numfields)) {
+    Record rec;
+    rec.id = id;
+    rec.kv_arr.reserve(numfields);
+
+    while (numfields--) {
+      unsigned char *key, *value;
+      int64_t key_len, value_len;
+      streamIteratorGetField(&si, &key, &value, &key_len, &value_len);
+      string skey(reinterpret_cast<char*>(key), key_len);
+      string sval(reinterpret_cast<char*>(value), value_len);
+
+      rec.kv_arr.emplace_back(std::move(skey), std::move(sval));
+    }
+    records.push_back(std::move(rec));
+    arraylen++;
+    if (count && count == arraylen)
+      break;
+  }
+
+  streamIteratorStop(&si);
+
+  return records;
+}
+
+void GetGroupPEL(stream* s, streamCG* cg, long long count, GroupInfo* ginfo) {
+  vector<NACKInfo> nack_info_vec;
+  long long arraylen_cg_pel = 0;
+  raxIterator ri_cg_pel;
+  raxStart(&ri_cg_pel, cg->pel);
+  raxSeek(&ri_cg_pel, "^", NULL, 0);
+  while (raxNext(&ri_cg_pel) && (!count || arraylen_cg_pel < count)) {
+    streamNACK* nack = static_cast<streamNACK*>(ri_cg_pel.data);
+    NACKInfo nack_info;
+
+    streamID id;
+    streamDecodeID(ri_cg_pel.key, &id);
+    nack_info.pel_id = id;
+    nack_info.consumer_name = nack->consumer->name;
+    nack_info.delivery_time = nack->delivery_time;
+    nack_info.delivery_count = nack->delivery_count;
+
+    nack_info_vec.push_back(nack_info);
+    arraylen_cg_pel++;
+  }
+  raxStop(&ri_cg_pel);
+  ginfo->stream_nack_vec = std::move(nack_info_vec);
+}
+
+void GetConsumers(stream* s, streamCG* cg, long long count, GroupInfo* ginfo) {
+  vector<ConsumerInfo> consumer_info_vec;
+  raxIterator ri_consumers;
+  raxStart(&ri_consumers, cg->consumers);
+  raxSeek(&ri_consumers, "^", NULL, 0);
+  while (raxNext(&ri_consumers)) {
+    ConsumerInfo consumer_info;
+    streamConsumer* consumer = static_cast<streamConsumer*>(ri_consumers.data);
+
+    LOG_IF(DFATAL, consumer->pel->numnodes == 0) << "Invalid rax state";
+
+    consumer_info.name = consumer->name;
+    consumer_info.seen_time = consumer->seen_time;
+    consumer_info.active_time = consumer->active_time;
+    consumer_info.pel_count = raxSize(consumer->pel);
+
+    /* Consumer PEL */
+    long long arraylen_cpel = 0;
+    raxIterator ri_cpel;
+    raxStart(&ri_cpel, consumer->pel);
+    raxSeek(&ri_cpel, "^", NULL, 0);
+    vector<NACKInfo> consumer_pel_vec;
+    while (raxNext(&ri_cpel) && (!count || arraylen_cpel < count)) {
+      NACKInfo nack_info;
+      streamNACK* nack = static_cast<streamNACK*>(ri_cpel.data);
+
+      streamID id;
+      streamDecodeID(ri_cpel.key, &id);
+      nack_info.pel_id = id;
+      nack_info.delivery_time = nack->delivery_time;
+      nack_info.delivery_count = nack->delivery_count;
+
+      consumer_pel_vec.push_back(nack_info);
+      arraylen_cpel++;
+    }
+    consumer_info.pending = consumer_pel_vec;
+    consumer_info_vec.push_back(consumer_info);
+    raxStop(&ri_cpel);
+  }
+  raxStop(&ri_consumers);
+  ginfo->consumer_info_vec = std::move(consumer_info_vec);
+}
+
+OpResult<StreamInfo> OpStreams(const DbContext& db_cntx, string_view key, EngineShard* shard,
+                               int full, size_t count) {
+  auto& db_slice = db_cntx.GetDbSlice(shard->shard_id());
+  auto res_it = db_slice.FindReadOnly(db_cntx, key, OBJ_STREAM);
+  if (!res_it)
+    return res_it.status();
+
+  vector<StreamInfo> result;
+  const CompactObj& cobj = (*res_it)->second;
+  stream* s = (stream*)cobj.RObjPtr();
+
+  StreamInfo sinfo;
+  sinfo.length = s->length;
+
+  sinfo.radix_tree_keys = raxSize(s->rax_tree);
+  sinfo.radix_tree_nodes = s->rax_tree->numnodes;
+  sinfo.last_generated_id = s->last_id;
+  sinfo.max_deleted_entry_id = s->max_deleted_entry_id;
+  sinfo.entries_added = s->entries_added;
+  sinfo.recorded_first_entry_id = s->first_id;
+  sinfo.groups = s->cgroups ? raxSize(s->cgroups) : 0;
+  sinfo.entries = GetStreamRecords(s, s->first_id, s->last_id, false, count);
+
+  if (full) {
+    if (s->cgroups) {
+      GroupInfoVec group_info_vec;
+
+      raxIterator ri_cgroups;
+      raxStart(&ri_cgroups, s->cgroups);
+      raxSeek(&ri_cgroups, "^", NULL, 0);
+      while (raxNext(&ri_cgroups)) {
+        streamCG* cg = (streamCG*)ri_cgroups.data;
+        GroupInfo ginfo;
+        ginfo.name.assign(reinterpret_cast<char*>(ri_cgroups.key), ri_cgroups.key_len);
+        ginfo.last_id = cg->last_id;
+        ginfo.consumer_size = raxSize(cg->consumers);
+        ginfo.pending_size = raxSize(cg->pel);
+        ginfo.entries_read = cg->entries_read;
+        ginfo.lag = streamCGLag(s, cg);
+        GetGroupPEL(s, cg, count, &ginfo);
+        GetConsumers(s, cg, count, &ginfo);
+
+        group_info_vec.push_back(ginfo);
+      }
+      raxStop(&ri_cgroups);
+
+      sinfo.cgroups = group_info_vec;
+    }
+  } else {
+    vector<Record> first_entry_vector = GetStreamRecords(s, s->first_id, s->last_id, false, 1);
+    if (first_entry_vector.size() != 0) {
+      sinfo.first_entry = first_entry_vector.at(0);
+    }
+    vector<Record> last_entry_vector = GetStreamRecords(s, s->first_id, s->last_id, true, 1);
+    if (last_entry_vector.size() != 0) {
+      sinfo.last_entry = last_entry_vector.at(0);
+    }
+  }
+
+  return sinfo;
+}
+
+OpResult<vector<ConsumerInfo>> OpConsumers(const DbContext& db_cntx, EngineShard* shard,
+                                           string_view stream_name, string_view group_name) {
+  auto& db_slice = db_cntx.GetDbSlice(shard->shard_id());
+  auto res_it = db_slice.FindReadOnly(db_cntx, stream_name, OBJ_STREAM);
+  if (!res_it)
+    return res_it.status();
+
+  vector<ConsumerInfo> result;
+  const CompactObj& cobj = (*res_it)->second;
+  stream* s = GetReadOnlyStream(cobj);
+  streamCG* cg = streamLookupCG(s, WrapSds(group_name));
+  if (cg == NULL) {
+    return OpStatus::INVALID_VALUE;
+  }
+  result.reserve(raxSize(s->cgroups));
+
+  raxIterator ri;
+  raxStart(&ri, cg->consumers);
+  raxSeek(&ri, "^", NULL, 0);
+  mstime_t now = db_cntx.time_now_ms;
+  while (raxNext(&ri)) {
+    ConsumerInfo consumer_info;
+    streamConsumer* consumer = (streamConsumer*)ri.data;
+    mstime_t idle = now - consumer->seen_time;
+    if (idle < 0)
+      idle = 0;
+
+    consumer_info.name = consumer->name;
+    consumer_info.pel_count = raxSize(consumer->pel);
+    consumer_info.idle = idle;
+    consumer_info.active_time = consumer->active_time;
+    result.push_back(std::move(consumer_info));
+  }
+  raxStop(&ri);
   return result;
 }
 
@@ -852,9 +1205,10 @@ struct CreateOpts {
 };
 
 OpStatus OpCreate(const OpArgs& op_args, string_view key, const CreateOpts& opts) {
-  auto* shard = op_args.shard;
-  auto& db_slice = shard->db_slice();
-  OpResult<PrimeIterator> res_it = db_slice.Find(op_args.db_cntx, key, OBJ_STREAM);
+  auto& db_slice = op_args.GetDbSlice();
+  auto res_it = db_slice.FindMutable(op_args.db_cntx, key, OBJ_STREAM);
+  int64_t entries_read = SCG_INVALID_ENTRIES_READ;
+  StreamMemTracker mem_tracker;
   if (!res_it) {
     if (opts.flags & kCreateOptMkstream) {
       // MKSTREAM is enabled, so create the stream
@@ -862,15 +1216,16 @@ OpStatus OpCreate(const OpArgs& op_args, string_view key, const CreateOpts& opts
       if (!res_it)
         return res_it.status();
 
-      robj* stream_obj = createStreamObject();
-      (*res_it)->second.ImportRObj(stream_obj);
+      stream* s = streamNew();
+      res_it->it->second.InitRobj(OBJ_STREAM, OBJ_ENCODING_STREAM, s);
     } else {
       return res_it.status();
     }
   }
 
-  CompactObj& cobj = (*res_it)->second;
+  CompactObj& cobj = res_it->it->second;
   stream* s = (stream*)cobj.RObjPtr();
+
   streamID id;
   ParsedStreamId parsed_id;
   if (opts.id == "$") {
@@ -883,46 +1238,207 @@ OpStatus OpCreate(const OpArgs& op_args, string_view key, const CreateOpts& opts
     }
   }
 
-  streamCG* cg = streamCreateCG(s, opts.gname.data(), opts.gname.size(), &id, 0);
-  if (cg) {
-    return OpStatus::OK;
-  }
-  return OpStatus::BUSY_GROUP;
+  streamCG* cg = streamCreateCG(s, opts.gname.data(), opts.gname.size(), &id, entries_read);
+  mem_tracker.UpdateStreamSize(res_it->it->second);
+  return cg ? OpStatus::OK : OpStatus::BUSY_GROUP;
 }
 
-OpResult<pair<stream*, streamCG*>> FindGroup(const OpArgs& op_args, string_view key,
-                                             string_view gname) {
-  auto* shard = op_args.shard;
-  auto& db_slice = shard->db_slice();
-  OpResult<PrimeIterator> res_it = db_slice.Find(op_args.db_cntx, key, OBJ_STREAM);
-  if (!res_it)
-    return res_it.status();
+struct FindGroupResult {
+  stream* s = nullptr;
+  streamCG* cg = nullptr;
+  DbSlice::AutoUpdater post_updater;
+  DbSlice::Iterator it;
+};
 
-  CompactObj& cobj = (*res_it)->second;
-  pair<stream*, streamCG*> res;
-  res.first = (stream*)cobj.RObjPtr();
-  shard->tmp_str1 = sdscpylen(shard->tmp_str1, gname.data(), gname.size());
-  res.second = streamLookupCG(res.first, shard->tmp_str1);
+OpResult<FindGroupResult> FindGroup(const OpArgs& op_args, string_view key, string_view gname,
+                                    bool skip_group = true) {
+  auto& db_slice = op_args.GetDbSlice();
+  auto res_it = db_slice.FindMutable(op_args.db_cntx, key, OBJ_STREAM);
+  RETURN_ON_BAD_STATUS(res_it);
 
-  return res;
+  CompactObj& cobj = res_it->it->second;
+  auto* s = static_cast<stream*>(cobj.RObjPtr());
+  auto* cg = streamLookupCG(s, WrapSds(gname));
+  if (skip_group && !cg)
+    return OpStatus::SKIPPED;
+
+  return FindGroupResult{s, cg, std::move(res_it->post_updater), res_it->it};
+}
+
+// Try to get the consumer. If not found, create a new one.
+streamConsumer* FindOrAddConsumer(string_view name, streamCG* cg, uint64_t now_ms) {
+  // Try to get the consumer. If not found, create a new one.
+  auto cname = WrapSds(name);
+  streamConsumer* consumer = streamLookupConsumer(cg, cname);
+  if (consumer)
+    consumer->seen_time = now_ms;
+  else  // TODO: notify xgroup-createconsumer event once we support stream events.
+    consumer = StreamCreateConsumer(cg, name, now_ms, SCC_DEFAULT);
+  return consumer;
+}
+
+constexpr uint8_t kClaimForce = 1 << 0;
+constexpr uint8_t kClaimJustID = 1 << 1;
+constexpr uint8_t kClaimLastID = 1 << 2;
+
+struct ClaimOpts {
+  string_view group;
+  string_view consumer;
+  int64 min_idle_time;
+  int64 delivery_time = -1;
+  int retry = -1;
+  uint8_t flags = 0;
+  int32_t count = 100;      // only for XAUTOCLAIM
+  streamID start = {0, 0};  // only for XAUTOCLAIM
+  streamID last_id;
+};
+
+struct ClaimInfo {
+  bool justid = false;
+  vector<streamID> ids;
+  RecordVec records;
+  streamID end_id = {0, 0};      // only for XAUTOCLAIM
+  vector<streamID> deleted_ids;  // only for XAUTOCLAIM
+};
+
+void AppendClaimResultItem(ClaimInfo& result, stream* s, streamID id) {
+  int64_t numfields;
+  if (result.justid) {
+    result.ids.push_back(id);
+    return;
+  }
+  streamIterator it;
+  streamID cid;
+  streamIteratorStart(&it, s, &id, &id, 0);
+  while (streamIteratorGetID(&it, &cid, &numfields)) {
+    Record rec;
+    rec.id = cid;
+    rec.kv_arr.reserve(numfields);
+
+    /* Emit the field-value pairs. */
+    while (numfields--) {
+      unsigned char *key, *value;
+      int64_t key_len, value_len;
+      streamIteratorGetField(&it, &key, &value, &key_len, &value_len);
+      string skey(reinterpret_cast<char*>(key), key_len);
+      string sval(reinterpret_cast<char*>(value), value_len);
+
+      rec.kv_arr.emplace_back(std::move(skey), std::move(sval));
+    }
+    result.records.push_back(std::move(rec));
+  }
+  streamIteratorStop(&it);
+}
+
+// XCLAIM key group consumer min-idle-time id
+OpResult<ClaimInfo> OpClaim(const OpArgs& op_args, string_view key, const ClaimOpts& opts,
+                            absl::Span<streamID> ids) {
+  auto cgr_res = FindGroup(op_args, key, opts.group);
+  RETURN_ON_BAD_STATUS(cgr_res);
+
+  uint64_t now_ms = op_args.db_cntx.time_now_ms;
+  ClaimInfo result;
+  result.justid = (opts.flags & kClaimJustID);
+
+  streamID last_id = opts.last_id;
+  if (opts.flags & kClaimLastID) {
+    if (streamCompareID(&last_id, &cgr_res->cg->last_id) > 0) {
+      cgr_res->cg->last_id = last_id;
+    }
+  }
+
+  StreamMemTracker tracker;
+
+  streamConsumer* consumer = FindOrAddConsumer(opts.consumer, cgr_res->cg, now_ms);
+
+  for (streamID id : ids) {
+    std::array<uint8_t, sizeof(streamID)> buf;
+    StreamEncodeID(buf.begin(), &id);
+
+    streamNACK* nack = (streamNACK*)raxFind(cgr_res->cg->pel, buf.begin(), sizeof(buf));
+    if (!streamEntryExists(cgr_res->s, &id)) {
+      if (nack != raxNotFound) {
+        /* Release the NACK */
+        raxRemove(cgr_res->cg->pel, buf.begin(), sizeof(buf), nullptr);
+        raxRemove(nack->consumer->pel, buf.begin(), sizeof(buf), nullptr);
+        LOG_IF(DFATAL, nack->consumer->pel->numnodes == 0) << "Invalid rax state";
+        streamFreeNACK(nack);
+      }
+      continue;
+    }
+
+    // We didn't find a nack but the FORCE option is given.
+    // Create the NACK forcefully.
+    if ((opts.flags & kClaimForce) && nack == raxNotFound) {
+      /* Create the NACK. */
+      nack = StreamCreateNACK(nullptr, now_ms);
+      raxInsert(cgr_res->cg->pel, buf.begin(), sizeof(buf), nack, nullptr);
+    }
+
+    // We found the nack, continue.
+    if (nack != raxNotFound) {
+      // First check if the entry id exceeds the `min_idle_time`.
+      if (nack->consumer && opts.min_idle_time) {
+        mstime_t this_idle = now_ms - nack->delivery_time;
+        if (this_idle < opts.min_idle_time) {
+          continue;
+        }
+      }
+
+      // If the entry belongs to the same consumer, we don't have to
+      // do anything. Else remove the entry from the old consumer.
+      if (nack->consumer != consumer) {
+        /* Remove the entry from the old consumer.
+         * Note that nack->consumer is NULL if we created the
+         * NACK above because of the FORCE option. */
+        if (nack->consumer) {
+          raxRemove(nack->consumer->pel, buf.begin(), sizeof(buf), nullptr);
+          LOG_IF(DFATAL, nack->consumer->pel->numnodes == 0) << "Invalid rax state";
+        }
+      }
+      // Set the delivery time for the entry.
+      nack->delivery_time = opts.delivery_time;
+      /* Set the delivery attempts counter if given, otherwise
+       * autoincrement unless JUSTID option provided */
+      if (opts.retry >= 0) {
+        nack->delivery_count = opts.retry;
+      } else if (!(opts.flags & kClaimJustID)) {
+        nack->delivery_count++;
+      }
+      if (nack->consumer != consumer) {
+        /* Add the entry in the new consumer local PEL. */
+        raxInsert(consumer->pel, buf.begin(), sizeof(buf), nack, nullptr);
+        nack->consumer = consumer;
+      }
+      consumer->active_time = now_ms;
+
+      /* Send the reply for this entry. */
+      AppendClaimResultItem(result, cgr_res->s, id);
+      // TODO: propagate this change with streamPropagateXCLAIM
+    }
+  }
+  tracker.UpdateStreamSize(cgr_res->it->second);
+  return result;
 }
 
 // XGROUP DESTROY key groupname
 OpStatus OpDestroyGroup(const OpArgs& op_args, string_view key, string_view gname) {
-  OpResult<pair<stream*, streamCG*>> cgr_res = FindGroup(op_args, key, gname);
-  if (!cgr_res)
-    return cgr_res.status();
+  auto cgr_res = FindGroup(op_args, key, gname);
+  RETURN_ON_BAD_STATUS(cgr_res);
+  StreamMemTracker mem_tracker;
 
-  stream* s = cgr_res->first;
-  streamCG* scg = cgr_res->second;
+  raxRemove(cgr_res->s->cgroups, (uint8_t*)(gname.data()), gname.size(), NULL);
+  streamFreeCG(cgr_res->cg);
 
-  if (scg) {
-    raxRemove(s->cgroups, (uint8_t*)(gname.data()), gname.size(), NULL);
-    streamFreeCG(scg);
-    return OpStatus::OK;
+  mem_tracker.UpdateStreamSize(cgr_res->it->second);
+
+  // Awake readers blocked on this group
+  auto blocking_controller = op_args.db_cntx.ns->GetBlockingController(op_args.shard->shard_id());
+  if (blocking_controller) {
+    blocking_controller->AwakeWatched(op_args.db_cntx.db_index, key);
   }
 
-  return OpStatus::SKIPPED;
+  return OpStatus::OK;
 }
 
 struct GroupConsumerPair {
@@ -935,92 +1451,47 @@ struct GroupConsumerPairOpts {
   string_view consumer;
 };
 
-vector<GroupConsumerPair> OpGetGroupConsumerPairs(ArgSlice slice_args, const OpArgs& op_args,
-                                                  const GroupConsumerPairOpts& opts) {
-  vector<GroupConsumerPair> sid_items(slice_args.size());
-
-  // get group and consumer
-  for (size_t i = 0; i < slice_args.size(); i++) {
-    string_view key = slice_args[i];
-    streamCG* group = nullptr;
-    streamConsumer* consumer = nullptr;
-    auto group_res = FindGroup(op_args, key, opts.group);
-    if (!group_res) {
-      continue;
-    }
-    if (group = group_res->second; !group) {
-      continue;
-    }
-
-    op_args.shard->tmp_str1 =
-        sdscpylen(op_args.shard->tmp_str1, opts.consumer.data(), opts.consumer.size());
-    consumer = streamLookupConsumer(group, op_args.shard->tmp_str1, SLC_NO_REFRESH);
-    if (!consumer) {
-      consumer = streamCreateConsumer(group, op_args.shard->tmp_str1, NULL, 0,
-                                      SCC_NO_NOTIFY | SCC_NO_DIRTIFY);
-    }
-    sid_items[i] = {group, consumer};
-  }
-  return sid_items;
-}
-
 // XGROUP CREATECONSUMER key groupname consumername
 OpResult<uint32_t> OpCreateConsumer(const OpArgs& op_args, string_view key, string_view gname,
                                     string_view consumer_name) {
-  OpResult<pair<stream*, streamCG*>> cgroup_res = FindGroup(op_args, key, gname);
-  if (!cgroup_res)
-    return cgroup_res.status();
-  streamCG* cg = cgroup_res->second;
-  if (cg == nullptr)
-    return OpStatus::SKIPPED;
+  auto cgroup_res = FindGroup(op_args, key, gname);
+  RETURN_ON_BAD_STATUS(cgroup_res);
 
-  auto* shard = op_args.shard;
-  shard->tmp_str1 = sdscpylen(shard->tmp_str1, consumer_name.data(), consumer_name.size());
-  streamConsumer* consumer =
-      streamCreateConsumer(cg, shard->tmp_str1, NULL, 0, SCC_NO_NOTIFY | SCC_NO_DIRTIFY);
+  StreamMemTracker mem_tracker;
 
-  if (consumer)
-    return OpStatus::OK;
-  return OpStatus::KEY_EXISTS;
+  streamConsumer* consumer = StreamCreateConsumer(
+      cgroup_res->cg, consumer_name, op_args.db_cntx.time_now_ms, SCC_NO_NOTIFY | SCC_NO_DIRTIFY);
+
+  mem_tracker.UpdateStreamSize(cgroup_res->it->second);
+  return consumer ? OpStatus::OK : OpStatus::KEY_EXISTS;
 }
 
 // XGROUP DELCONSUMER key groupname consumername
 OpResult<uint32_t> OpDelConsumer(const OpArgs& op_args, string_view key, string_view gname,
                                  string_view consumer_name) {
-  OpResult<pair<stream*, streamCG*>> cgroup_res = FindGroup(op_args, key, gname);
-  if (!cgroup_res)
-    return cgroup_res.status();
-
-  streamCG* cg = cgroup_res->second;
-  if (cg == nullptr)
-    return OpStatus::SKIPPED;
+  auto cgroup_res = FindGroup(op_args, key, gname);
+  RETURN_ON_BAD_STATUS(cgroup_res);
+  StreamMemTracker mem_tracker;
 
   long long pending = 0;
-  auto* shard = op_args.shard;
-
-  shard->tmp_str1 = sdscpylen(shard->tmp_str1, consumer_name.data(), consumer_name.size());
-  streamConsumer* consumer = streamLookupConsumer(cg, shard->tmp_str1, SLC_NO_REFRESH);
+  streamConsumer* consumer = streamLookupConsumer(cgroup_res->cg, WrapSds(consumer_name));
   if (consumer) {
     pending = raxSize(consumer->pel);
-    streamDelConsumer(cg, consumer);
+    streamDelConsumer(cgroup_res->cg, consumer);
   }
 
+  mem_tracker.UpdateStreamSize(cgroup_res->it->second);
   return pending;
 }
 
 OpStatus OpSetId(const OpArgs& op_args, string_view key, string_view gname, string_view id) {
-  OpResult<pair<stream*, streamCG*>> cgr_res = FindGroup(op_args, key, gname);
-  if (!cgr_res)
-    return cgr_res.status();
-
-  streamCG* cg = cgr_res->second;
-  if (cg == nullptr)
-    return OpStatus::SKIPPED;
+  auto cgr_res = FindGroup(op_args, key, gname);
+  RETURN_ON_BAD_STATUS(cgr_res);
 
   streamID sid;
   ParsedStreamId parsed_id;
   if (id == "$") {
-    sid = cgr_res->first->last_id;
+    sid = cgr_res->s->last_id;
   } else {
     if (ParseID(id, true, 0, &parsed_id)) {
       sid = parsed_id.val;
@@ -1028,29 +1499,35 @@ OpStatus OpSetId(const OpArgs& op_args, string_view key, string_view gname, stri
       return OpStatus::SYNTAX_ERR;
     }
   }
-  cg->last_id = sid;
+  cgr_res->cg->last_id = sid;
 
   return OpStatus::OK;
 }
 
-OpStatus OpSetId2(const OpArgs& op_args, string_view key, const streamID& sid) {
-  auto* shard = op_args.shard;
-  auto& db_slice = shard->db_slice();
-  OpResult<PrimeIterator> res_it = db_slice.Find(op_args.db_cntx, key, OBJ_STREAM);
+ErrorReply OpXSetId(const OpArgs& op_args, string_view key, const streamID& sid) {
+  auto& db_slice = op_args.GetDbSlice();
+  auto res_it = db_slice.FindMutable(op_args.db_cntx, key, OBJ_STREAM);
   if (!res_it)
     return res_it.status();
 
-  CompactObj& cobj = (*res_it)->second;
+  StreamMemTracker mem_tracker;
+
+  CompactObj& cobj = res_it->it->second;
   stream* stream_inst = (stream*)cobj.RObjPtr();
   long long entries_added = -1;
   streamID max_xdel_id{0, 0};
+  streamID id = sid;
+
+  if (streamCompareID(&id, &stream_inst->max_deleted_entry_id) < 0) {
+    return ErrorReply{"The ID specified in XSETID is smaller than current max_deleted_entry_id",
+                      "stream_smaller_deleted"};
+  }
 
   /* If the stream has at least one item, we want to check that the user
    * is setting a last ID that is equal or greater than the current top
    * item, otherwise the fundamental ID monotonicity assumption is violated. */
   if (stream_inst->length > 0) {
     streamID maxid;
-    streamID id = sid;
     streamLastValidID(stream_inst, &maxid);
 
     if (streamCompareID(&id, &maxid) < 0) {
@@ -1059,7 +1536,9 @@ OpStatus OpSetId2(const OpArgs& op_args, string_view key, const streamID& sid) {
 
     /* If an entries_added was provided, it can't be lower than the length. */
     if (entries_added != -1 && stream_inst->length > uint64_t(entries_added)) {
-      return OpStatus::ENTRIES_ADDED_SMALL;
+      return ErrorReply{
+          "The entries_added specified in XSETID is smaller than the target stream length",
+          "stream_added_small"};
     }
   }
 
@@ -1069,21 +1548,24 @@ OpStatus OpSetId2(const OpArgs& op_args, string_view key, const streamID& sid) {
   if (!streamIDEqZero(&max_xdel_id))
     stream_inst->max_deleted_entry_id = max_xdel_id;
 
+  mem_tracker.UpdateStreamSize(cobj);
+
   return OpStatus::OK;
 }
 
 OpResult<uint32_t> OpDel(const OpArgs& op_args, string_view key, absl::Span<streamID> ids) {
-  auto* shard = op_args.shard;
-  auto& db_slice = shard->db_slice();
-  OpResult<PrimeIterator> res_it = db_slice.Find(op_args.db_cntx, key, OBJ_STREAM);
+  auto& db_slice = op_args.GetDbSlice();
+  auto res_it = db_slice.FindMutable(op_args.db_cntx, key, OBJ_STREAM);
   if (!res_it)
     return res_it.status();
 
-  CompactObj& cobj = (*res_it)->second;
+  CompactObj& cobj = res_it->it->second;
   stream* stream_inst = (stream*)cobj.RObjPtr();
 
   uint32_t deleted = 0;
   bool first_entry = false;
+
+  StreamMemTracker tracker;
 
   for (size_t j = 0; j < ids.size(); j++) {
     streamID id = ids[j];
@@ -1112,134 +1594,435 @@ OpResult<uint32_t> OpDel(const OpArgs& op_args, string_view key, absl::Span<stre
     }
   }
 
+  tracker.UpdateStreamSize(cobj);
   return deleted;
 }
 
-void CreateGroup(CmdArgList args, string_view key, ConnectionContext* cntx) {
-  if (args.size() < 2)
-    return (*cntx)->SendError(UnknownSubCmd("CREATE", "XGROUP"));
+// XACK key groupname id [id ...]
+OpResult<uint32_t> OpAck(const OpArgs& op_args, string_view key, string_view gname,
+                         absl::Span<streamID> ids) {
+  auto res = FindGroup(op_args, key, gname, false);
+  RETURN_ON_BAD_STATUS(res);
+
+  if (res->cg == nullptr || res->s == nullptr) {
+    return 0;
+  }
+
+  int acknowledged = 0;
+  StreamMemTracker mem_tracker;
+  for (auto& id : ids) {
+    unsigned char buf[sizeof(streamID)];
+    streamEncodeID(buf, &id);
+
+    // From Redis' xackCommand's implemenation
+    // Lookup the ID in the group PEL: it will have a reference to the
+    // NACK structure that will have a reference to the consumer, so that
+    // we are able to remove the entry from both PELs.
+    streamNACK* nack = (streamNACK*)raxFind(res->cg->pel, buf, sizeof(buf));
+    if (nack != raxNotFound) {
+      raxRemove(res->cg->pel, buf, sizeof(buf), nullptr);
+      raxRemove(nack->consumer->pel, buf, sizeof(buf), nullptr);
+      streamFreeNACK(nack);
+      acknowledged++;
+    }
+  }
+  mem_tracker.UpdateStreamSize(res->it->second);
+  return acknowledged;
+}
+
+OpResult<ClaimInfo> OpAutoClaim(const OpArgs& op_args, string_view key, const ClaimOpts& opts) {
+  auto cgr_res = FindGroup(op_args, key, opts.group, false);
+  RETURN_ON_BAD_STATUS(cgr_res);
+
+  stream* stream = cgr_res->s;
+  streamCG* group = cgr_res->cg;
+
+  if (stream == nullptr || group == nullptr) {
+    return OpStatus::KEY_NOTFOUND;
+  }
+
+  StreamMemTracker mem_tracker;
+
+  // from Redis spec on XAutoClaim:
+  // https://redis.io/commands/xautoclaim/
+  // The maximum number of pending entries that the command scans is the product of
+  // multiplying <count>'s value by 10 (hard-coded).
+  int64_t attempts = opts.count * 10;
+
+  unsigned char start_key[sizeof(streamID)];
+  streamID start_id = opts.start;
+  streamEncodeID(start_key, &start_id);
+  raxIterator ri;
+  raxStart(&ri, group->pel);
+  raxSeek(&ri, ">=", start_key, sizeof(start_key));
+
+  ClaimInfo result;
+  result.justid = (opts.flags & kClaimJustID);
+
+  uint64_t now_ms = op_args.db_cntx.time_now_ms;
+  int count = opts.count;
+
+  streamConsumer* consumer = FindOrAddConsumer(opts.consumer, group, now_ms);
+
+  while (attempts-- && count && raxNext(&ri)) {
+    streamNACK* nack = (streamNACK*)ri.data;
+
+    streamID id;
+    streamDecodeID(ri.key, &id);
+
+    if (!streamEntryExists(stream, &id)) {
+      // TODO: to propagate this change to replica as XCLAIM command
+      // - since we delete it from NACK. See streamPropagateXCLAIM call.
+      raxRemove(group->pel, ri.key, ri.key_len, nullptr);
+      raxRemove(nack->consumer->pel, ri.key, ri.key_len, nullptr);
+      streamFreeNACK(nack);
+      result.deleted_ids.push_back(id);
+      raxSeek(&ri, ">=", ri.key, ri.key_len);
+
+      count--; /* Count is a limit of the command response size. */
+      continue;
+    }
+
+    if (opts.min_idle_time) {
+      mstime_t this_idle = now_ms - nack->delivery_time;
+      if (this_idle < opts.min_idle_time)
+        continue;
+    }
+
+    if (nack->consumer != consumer) {
+      /* Remove the entry from the old consumer.
+       * Note that nack->consumer is NULL if we created the
+       * NACK above because of the FORCE option. */
+      if (nack->consumer) {
+        raxRemove(nack->consumer->pel, ri.key, ri.key_len, nullptr);
+      }
+    }
+
+    nack->delivery_time = now_ms;
+    if (!result.justid) {
+      nack->delivery_count++;
+    }
+
+    if (nack->consumer != consumer) {
+      raxInsert(consumer->pel, ri.key, ri.key_len, nack, nullptr);
+      nack->consumer = consumer;
+    }
+    consumer->active_time = now_ms;
+    AppendClaimResultItem(result, stream, id);
+    count--;
+    // TODO: propagate xclaim to replica
+  }
+
+  raxNext(&ri);
+  streamID end_id;
+  if (raxEOF(&ri)) {
+    end_id.ms = end_id.seq = 0;
+  } else {
+    streamDecodeID(ri.key, &end_id);
+  }
+  raxStop(&ri);
+  result.end_id = end_id;
+
+  mem_tracker.UpdateStreamSize(cgr_res->it->second);
+
+  return result;
+}
+
+struct PendingOpts {
+  string_view group_name;
+  string_view consumer_name;
+  ParsedStreamId start;
+  ParsedStreamId end;
+  int64_t min_idle_time = 0;
+  int64_t count = -1;
+};
+
+struct PendingReducedResult {
+  uint64_t count = 0;
+  streamID start;
+  streamID end;
+  vector<pair<string_view, uint64_t /* size of consumer pending list*/>> consumer_list;
+};
+
+struct PendingExtendedResult {
+  streamID start;
+  string_view consumer_name;
+  uint64_t delivery_count;
+  mstime_t elapsed;
+};
+
+using PendingExtendedResultList = std::vector<PendingExtendedResult>;
+using PendingResult = std::variant<PendingReducedResult, PendingExtendedResultList>;
+
+PendingReducedResult GetPendingReducedResult(streamCG* cg) {
+  PendingReducedResult result;
+  result.count = raxSize(cg->pel);
+  if (!result.count) {
+    return result;
+  }
+
+  raxIterator ri;
+
+  raxStart(&ri, cg->pel);
+  raxSeek(&ri, "^", nullptr, 0);
+  raxNext(&ri);
+  streamDecodeID(ri.key, &result.start);
+
+  raxSeek(&ri, "$", nullptr, 0);
+  raxNext(&ri);
+  streamDecodeID(ri.key, &result.end);
+
+  raxStart(&ri, cg->consumers);
+  raxSeek(&ri, "^", nullptr, 0);
+  while (raxNext(&ri)) {
+    streamConsumer* consumer = static_cast<streamConsumer*>(ri.data);
+    uint64_t pel_size = raxSize(consumer->pel);
+    if (!pel_size)
+      continue;
+
+    pair<string_view, uint64_t> item;
+    item.first = string_view{consumer->name, sdslen(consumer->name)};
+    item.second = pel_size;
+    result.consumer_list.push_back(item);
+  }
+  raxStop(&ri);
+  return result;
+}
+
+PendingExtendedResultList GetPendingExtendedResult(uint64_t now_ms, streamCG* cg,
+                                                   streamConsumer* consumer,
+                                                   const PendingOpts& opts) {
+  PendingExtendedResultList result;
+  rax* pel = consumer ? consumer->pel : cg->pel;
+  streamID sstart = opts.start.val, send = opts.end.val;
+  unsigned char start_key[sizeof(streamID)];
+  unsigned char end_key[sizeof(streamID)];
+  raxIterator ri;
+
+  StreamEncodeID(start_key, &sstart);
+  StreamEncodeID(end_key, &send);
+  raxStart(&ri, pel);
+  raxSeek(&ri, ">=", start_key, sizeof(start_key));
+
+  auto count = opts.count;
+  while (count && raxNext(&ri)) {
+    if (memcmp(ri.key, end_key, ri.key_len) > 0) {
+      break;
+    }
+    streamNACK* nack = static_cast<streamNACK*>(ri.data);
+
+    if (opts.min_idle_time) {
+      mstime_t this_idle = now_ms - nack->delivery_time;
+      if (this_idle < opts.min_idle_time) {
+        continue;
+      }
+    }
+
+    count--;
+
+    /* Entry ID. */
+    streamID id;
+    streamDecodeID(ri.key, &id);
+
+    /* Milliseconds elapsed since last delivery. */
+    mstime_t elapsed = now_ms - nack->delivery_time;
+    if (elapsed < 0) {
+      elapsed = 0;
+    }
+
+    PendingExtendedResult item = {.start = id,
+                                  .consumer_name = nack->consumer->name,
+                                  .delivery_count = nack->delivery_count,
+                                  .elapsed = elapsed};
+    result.push_back(item);
+  }
+  raxStop(&ri);
+  return result;
+}
+
+OpResult<PendingResult> OpPending(const OpArgs& op_args, string_view key, const PendingOpts& opts) {
+  auto cgroup_res = FindGroup(op_args, key, opts.group_name);
+  RETURN_ON_BAD_STATUS(cgroup_res);
+
+  streamConsumer* consumer = nullptr;
+  if (!opts.consumer_name.empty()) {
+    consumer = streamLookupConsumer(cgroup_res->cg, WrapSds(opts.consumer_name));
+  }
+
+  PendingResult result;
+
+  if (opts.count == -1) {
+    result = GetPendingReducedResult(cgroup_res->cg);
+  } else {
+    result = GetPendingExtendedResult(op_args.db_cntx.time_now_ms, cgroup_res->cg, consumer, opts);
+  }
+  return result;
+}
+
+void CreateGroup(facade::CmdArgParser* parser, Transaction* tx, SinkReplyBuilder* builder) {
+  auto key = parser->Next();
 
   CreateOpts opts;
-  opts.gname = ArgS(args, 0);
-  opts.id = ArgS(args, 1);
-  if (args.size() >= 3) {
-    ToUpper(&args[2]);
-    if (ArgS(args, 2) == "MKSTREAM")
-      opts.flags |= kCreateOptMkstream;
+  std::tie(opts.gname, opts.id) = parser->Next<string_view, string_view>();
+  if (parser->Check("MKSTREAM")) {
+    opts.flags |= kCreateOptMkstream;
   }
+
+  if (auto err = parser->Error(); err)
+    return builder->SendError(err->MakeReply());
 
   auto cb = [&](Transaction* t, EngineShard* shard) {
     return OpCreate(t->GetOpArgs(shard), key, opts);
   };
 
-  OpStatus result = cntx->transaction->ScheduleSingleHop(std::move(cb));
+  OpStatus result = tx->ScheduleSingleHop(std::move(cb));
   switch (result) {
     case OpStatus::KEY_NOTFOUND:
-      return (*cntx)->SendError(kXGroupKeyNotFound);
+      return builder->SendError(kXGroupKeyNotFound);
     default:
-      (*cntx)->SendError(result);
+      builder->SendError(result);
   }
 }
 
-void DestroyGroup(string_view key, string_view gname, ConnectionContext* cntx) {
-  auto cb = [&](Transaction* t, EngineShard* shard) {
+void DestroyGroup(facade::CmdArgParser* parser, Transaction* tx, SinkReplyBuilder* builder) {
+  auto [key, gname] = parser->Next<string_view, string_view>();
+
+  if (auto err = parser->Error(); err)
+    return builder->SendError(err->MakeReply());
+
+  if (parser->HasNext())
+    return builder->SendError(UnknownSubCmd("DESTROY", "XGROUP"));
+
+  auto cb = [&, &key = key, &gname = gname](Transaction* t, EngineShard* shard) {
     return OpDestroyGroup(t->GetOpArgs(shard), key, gname);
   };
 
-  OpStatus result = cntx->transaction->ScheduleSingleHop(std::move(cb));
+  OpStatus result = tx->ScheduleSingleHop(std::move(cb));
   switch (result) {
     case OpStatus::OK:
-      return (*cntx)->SendLong(1);
+      return builder->SendLong(1);
     case OpStatus::SKIPPED:
-      return (*cntx)->SendLong(0);
+      return builder->SendLong(0);
     case OpStatus::KEY_NOTFOUND:
-      return (*cntx)->SendError(kXGroupKeyNotFound);
+      return builder->SendError(kXGroupKeyNotFound);
     default:
-      (*cntx)->SendError(result);
+      builder->SendError(result);
   }
 }
 
-void CreateConsumer(string_view key, string_view gname, string_view consumer,
-                    ConnectionContext* cntx) {
-  auto cb = [&](Transaction* t, EngineShard* shard) {
+void CreateConsumer(facade::CmdArgParser* parser, Transaction* tx, SinkReplyBuilder* builder) {
+  auto [key, gname, consumer] = parser->Next<string_view, string_view, string_view>();
+
+  if (auto err = parser->Error(); err)
+    return builder->SendError(err->MakeReply());
+
+  if (parser->HasNext())
+    return builder->SendError(UnknownSubCmd("CREATECONSUMER", "XGROUP"));
+
+  auto cb = [&, &key = key, &gname = gname, &consumer = consumer](Transaction* t,
+                                                                  EngineShard* shard) {
     return OpCreateConsumer(t->GetOpArgs(shard), key, gname, consumer);
   };
-  OpResult<uint32_t> result = cntx->transaction->ScheduleSingleHopT(std::move(cb));
+  OpResult<uint32_t> result = tx->ScheduleSingleHopT(cb);
 
   switch (result.status()) {
     case OpStatus::OK:
-      return (*cntx)->SendLong(1);
+      return builder->SendLong(1);
     case OpStatus::KEY_EXISTS:
-      return (*cntx)->SendLong(0);
+      return builder->SendLong(0);
     case OpStatus::SKIPPED:
-      return (*cntx)->SendError(NoGroupError(key, gname));
+      return builder->SendError(NoGroupError(key, gname));
     case OpStatus::KEY_NOTFOUND:
-      return (*cntx)->SendError(kXGroupKeyNotFound);
+      return builder->SendError(kXGroupKeyNotFound);
     default:
-      (*cntx)->SendError(result.status());
+      builder->SendError(result.status());
   }
 }
 
-void DelConsumer(string_view key, string_view gname, string_view consumer,
-                 ConnectionContext* cntx) {
-  auto cb = [&](Transaction* t, EngineShard* shard) {
+void DelConsumer(facade::CmdArgParser* parser, Transaction* tx, SinkReplyBuilder* builder) {
+  auto [key, gname, consumer] = parser->Next<string_view, string_view, string_view>();
+
+  if (auto err = parser->Error(); err)
+    return builder->SendError(err->MakeReply());
+
+  if (parser->HasNext())
+    return builder->SendError(UnknownSubCmd("DELCONSUMER", "XGROUP"));
+
+  auto cb = [&, &key = key, &gname = gname, &consumer = consumer](Transaction* t,
+                                                                  EngineShard* shard) {
     return OpDelConsumer(t->GetOpArgs(shard), key, gname, consumer);
   };
 
-  OpResult<uint32_t> result = cntx->transaction->ScheduleSingleHopT(std::move(cb));
+  OpResult<uint32_t> result = tx->ScheduleSingleHopT(cb);
 
   switch (result.status()) {
     case OpStatus::OK:
-      return (*cntx)->SendLong(*result);
+      return builder->SendLong(*result);
     case OpStatus::SKIPPED:
-      return (*cntx)->SendError(NoGroupError(key, gname));
+      return builder->SendError(NoGroupError(key, gname));
     case OpStatus::KEY_NOTFOUND:
-      return (*cntx)->SendError(kXGroupKeyNotFound);
+      return builder->SendError(kXGroupKeyNotFound);
     default:
-      (*cntx)->SendError(result.status());
+      builder->SendError(result.status());
   }
 }
 
-void SetId(string_view key, string_view gname, CmdArgList args, ConnectionContext* cntx) {
-  string_view id = ArgS(args, 0);
+void SetId(facade::CmdArgParser* parser, Transaction* tx, SinkReplyBuilder* builder) {
+  auto [key, gname, id] = parser->Next<string_view, string_view, string_view>();
 
-  auto cb = [&](Transaction* t, EngineShard* shard) {
+  while (parser->HasNext()) {
+    if (parser->Check("ENTRIESREAD")) {
+      // TODO: to support ENTRIESREAD.
+      return builder->SendError(kSyntaxErr);
+    } else {
+      return builder->SendError(kSyntaxErr);
+    }
+  }
+
+  if (auto err = parser->Error(); err)
+    return builder->SendError(err->MakeReply());
+
+  auto cb = [&, &key = key, &gname = gname, &id = id](Transaction* t, EngineShard* shard) {
     return OpSetId(t->GetOpArgs(shard), key, gname, id);
   };
 
-  OpStatus result = cntx->transaction->ScheduleSingleHop(std::move(cb));
+  OpStatus result = tx->ScheduleSingleHop(std::move(cb));
   switch (result) {
     case OpStatus::SKIPPED:
-      return (*cntx)->SendError(NoGroupError(key, gname));
+      return builder->SendError(NoGroupError(key, gname));
     case OpStatus::KEY_NOTFOUND:
-      return (*cntx)->SendError(kXGroupKeyNotFound);
+      return builder->SendError(kXGroupKeyNotFound);
     default:
-      (*cntx)->SendError(result);
+      builder->SendError(result);
   }
 }
 
-void XGroupHelp(CmdArgList args, ConnectionContext* cntx) {
-  string_view help_arr[] = {
-      "CREATE <key> <groupname> <id|$> [option]",
-      "    Create a new consumer group. Options are:",
-      "    * MKSTREAM",
-      "      Create the empty stream if it does not exist.",
-      "CREATECONSUMER <key> <groupname> <consumer>",
-      "    Create a new consumer in the specified group.",
-      "DELCONSUMER <key> <groupname> <consumer>",
-      "    Remove the specified consumer.",
-      "DESTROY <key> <groupname>",
-      "    Remove the specified group.",
-      "SETID <key> <groupname> <id|$>",
-      "    Set the current group ID.",
-  };
-  return (*cntx)->SendSimpleStrArr(help_arr);
+void XGroupHelp(CmdArgList args, const CommandContext& cmd_cntx) {
+  string_view help_arr[] = {"XGROUP <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                            "CREATE <key> <groupname> <id|$> [option]",
+                            "    Create a new consumer group. Options are:",
+                            "    * MKSTREAM",
+                            "      Create the empty stream if it does not exist.",
+                            "    * ENTRIESREAD entries_read",
+                            "      Set the group's entries_read counter (internal use).",
+                            "CREATECONSUMER <key> <groupname> <consumer>",
+                            "    Create a new consumer in the specified group.",
+                            "DELCONSUMER <key> <groupname> <consumer>",
+                            "    Remove the specified consumer.",
+                            "DESTROY <key> <groupname>",
+                            "    Remove the specified group.",
+                            "SETID <key> <groupname> <id|$> [ENTRIESREAD entries_read]",
+                            "    Set the current group ID and entries_read counter.",
+                            "HELP",
+                            "    Print this help."};
+  auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx.rb);
+  return rb->SendSimpleStrArr(help_arr);
 }
 
-OpResult<int64_t> OpTrim(const OpArgs& op_args, const AddTrimOpts& opts) {
-  auto* shard = op_args.shard;
-  auto& db_slice = shard->db_slice();
-  OpResult<PrimeIterator> res_it = db_slice.Find(op_args.db_cntx, opts.key, OBJ_STREAM);
+OpResult<int64_t> OpTrim(const OpArgs& op_args, std::string_view key, const TrimOpts& opts,
+                         bool journal_as_minid) {
+  auto& db_slice = op_args.GetDbSlice();
+  auto res_it = db_slice.FindMutable(op_args.db_cntx, key, OBJ_STREAM);
   if (!res_it) {
     if (res_it.status() == OpStatus::KEY_NOTFOUND) {
       return 0;
@@ -1247,262 +2030,153 @@ OpResult<int64_t> OpTrim(const OpArgs& op_args, const AddTrimOpts& opts) {
     return res_it.status();
   }
 
-  CompactObj& cobj = (*res_it)->second;
+  StreamMemTracker mem_tracker;
+
+  CompactObj& cobj = res_it->it->second;
   stream* s = (stream*)cobj.RObjPtr();
 
-  return StreamTrim(opts, s);
-}
+  int64_t deleted_items_number = TrimStream(opts, s);
 
-optional<pair<AddTrimOpts, unsigned>> ParseAddOrTrimArgsOrReply(CmdArgList args,
-                                                                ConnectionContext* cntx,
-                                                                bool is_xadd) {
-  AddTrimOpts opts;
-  opts.key = ArgS(args, 0);
+  mem_tracker.UpdateStreamSize(cobj);
 
-  unsigned id_indx = 1;
-  for (; id_indx < args.size(); ++id_indx) {
-    ToUpper(&args[id_indx]);
-    string_view arg = ArgS(args, id_indx);
-
-    size_t remaining_args = args.size() - id_indx - 1;
-
-    if (is_xadd && arg == "NOMKSTREAM") {
-      opts.no_mkstream = true;
-    } else if ((arg == "MAXLEN" || arg == "MINID") && remaining_args >= 1) {
-      if (opts.trim_strategy != TrimStrategy::kNone) {
-        (*cntx)->SendError("MAXLEN and MINID options at the same time are not compatible",
-                           kSyntaxErr);
-        return std::nullopt;
-      }
-
-      if (arg == "MAXLEN") {
-        opts.trim_strategy = TrimStrategy::kMaxLen;
-      } else {
-        opts.trim_strategy = TrimStrategy::kMinId;
-      }
-
-      id_indx++;
-      arg = ArgS(args, id_indx);
-      if (remaining_args >= 2 && arg == "~") {
-        opts.trim_approx = true;
-        id_indx++;
-        arg = ArgS(args, id_indx);
-      } else if (remaining_args >= 2 && arg == "=") {
-        opts.trim_approx = false;
-        id_indx++;
-        arg = ArgS(args, id_indx);
-      }
-
-      if (opts.trim_strategy == TrimStrategy::kMaxLen && !absl::SimpleAtoi(arg, &opts.max_len)) {
-        (*cntx)->SendError(kInvalidIntErr);
-        return std::nullopt;
-      }
-      if (opts.trim_strategy == TrimStrategy::kMinId && !ParseID(arg, false, 0, &opts.minid)) {
-        (*cntx)->SendError(kSyntaxErr);
-        return std::nullopt;
-      }
-    } else if (arg == "LIMIT" && remaining_args >= 1 && opts.trim_strategy != TrimStrategy::kNone) {
-      if (!opts.trim_approx) {
-        (*cntx)->SendError(kSyntaxErr);
-        return std::nullopt;
-      }
-      ++id_indx;
-      if (!absl::SimpleAtoi(ArgS(args, id_indx), &opts.limit)) {
-        (*cntx)->SendError(kSyntaxErr);
-        return std::nullopt;
-      }
-    } else if (is_xadd) {
-      // There are still remaining field args.
-      break;
+  if (op_args.shard->journal() && journal_as_minid) {
+    const bool stream_is_empty = s->length == 0;
+    if (stream_is_empty) {
+      // We need remove the whole stream in replica
+      RecordJournal(op_args, "XTRIM"sv, ArgSlice{key, "MAXLEN"sv, "0"sv});
     } else {
-      (*cntx)->SendError(kSyntaxErr);
-      return std::nullopt;
+      // We need to set exact MinId in the journal.
+      // For this we are using new first_id from the stream
+      std::string last_id = StreamsIdToString(s->first_id);
+      RecordJournal(op_args, "XTRIM"sv, ArgSlice{key, "MINID"sv, last_id});
     }
   }
 
-  return make_pair(opts, id_indx);
+  return deleted_items_number;
 }
 
-}  // namespace
-
-void StreamFamily::XAdd(CmdArgList args, ConnectionContext* cntx) {
-  auto parse_resp = ParseAddOrTrimArgsOrReply(args, cntx, true);
-  if (!parse_resp) {
-    return;
+ParseResult<TrimOpts> ParseTrimOpts(bool max_len, CmdArgParser* parser) {
+  TrimOpts opts;
+  opts.approx = parser->Check("~");
+  if (!opts.approx) {
+    parser->Check("=");
   }
 
-  auto add_opts = parse_resp->first;
-  auto id_indx = parse_resp->second;
-
-  args.remove_prefix(id_indx);
-  if (args.size() < 2 || args.size() % 2 == 0) {
-    return (*cntx)->SendError(WrongNumArgsError("XADD"), kSyntaxErrType);
-  }
-
-  string_view id = ArgS(args, 0);
-
-  if (!ParseID(id, true, 0, &add_opts.parsed_id)) {
-    return (*cntx)->SendError(kInvalidStreamId, kSyntaxErrType);
-  }
-
-  args.remove_prefix(1);
-  auto cb = [&](Transaction* t, EngineShard* shard) {
-    return OpAdd(t->GetOpArgs(shard), add_opts, args);
-  };
-
-  OpResult<streamID> add_result = cntx->transaction->ScheduleSingleHopT(std::move(cb));
-  if (add_result) {
-    return (*cntx)->SendBulkString(StreamIdRepr(*add_result));
-  }
-
-  if (add_result.status() == OpStatus::STREAM_ID_SMALL) {
-    return (*cntx)->SendError(
-        "The ID specified in XADD is equal or smaller than "
-        "the target stream top item");
-  }
-
-  return (*cntx)->SendError(add_result.status());
-}
-
-void StreamFamily::XDel(CmdArgList args, ConnectionContext* cntx) {
-  string_view key = ArgS(args, 0);
-  args.remove_prefix(1);
-
-  absl::InlinedVector<streamID, 8> ids(args.size());
-
-  for (size_t i = 0; i < args.size(); ++i) {
+  if (max_len) {
+    opts.length_or_id = parser->Next<uint32_t>();
+  } else {
     ParsedStreamId parsed_id;
-    string_view str_id = ArgS(args, i);
-    if (!ParseID(str_id, true, 0, &parsed_id)) {
-      return (*cntx)->SendError(kInvalidStreamId, kSyntaxErrType);
+    if (!ParseID(parser->Next(), false, 0, &parsed_id)) {
+      return CreateSyntaxError(kSyntaxErr);
     }
-    ids[i] = parsed_id.val;
+
+    opts.length_or_id = parsed_id;  // trivial copy
   }
 
-  auto cb = [&](Transaction* t, EngineShard* shard) {
-    return OpDel(t->GetOpArgs(shard), key, absl::Span{ids.data(), ids.size()});
-  };
+  if (parser->Check("LIMIT")) {
+    if (!opts.approx) {
+      return CreateSyntaxError(kSyntaxErr);
+    }
 
-  OpResult<uint32_t> result = cntx->transaction->ScheduleSingleHopT(std::move(cb));
-  if (result || result.status() == OpStatus::KEY_NOTFOUND) {
-    return (*cntx)->SendLong(*result);
+    opts.limit = parser->Next<uint32_t>();
   }
 
-  (*cntx)->SendError(result.status());
+  return opts;
 }
 
-void StreamFamily::XGroup(CmdArgList args, ConnectionContext* cntx) {
-  ToUpper(&args[0]);
-  string_view sub_cmd = ArgS(args, 0);
-
-  if (args.size() >= 2) {
-    string_view key = ArgS(args, 1);
-    if (sub_cmd == "CREATE") {
-      args.remove_prefix(2);
-      return CreateGroup(std::move(args), key, cntx);
-    }
-
-    if (sub_cmd == "DESTROY" && args.size() == 3) {
-      string_view gname = ArgS(args, 2);
-      return DestroyGroup(key, gname, cntx);
-    }
-
-    if (sub_cmd == "CREATECONSUMER" && args.size() == 4) {
-      string_view gname = ArgS(args, 2);
-      string_view cname = ArgS(args, 3);
-      return CreateConsumer(key, gname, cname, cntx);
-    }
-
-    if (sub_cmd == "DELCONSUMER" && args.size() == 4) {
-      string_view gname = ArgS(args, 2);
-      string_view cname = ArgS(args, 3);
-      return DelConsumer(key, gname, cname, cntx);
-    }
-
-    if (sub_cmd == "SETID" && args.size() >= 4) {
-      string_view gname = ArgS(args, 2);
-      args.remove_prefix(3);
-      return SetId(key, gname, std::move(args), cntx);
-    }
+ParseResult<TrimOpts> ParseTrimOpts(CmdArgParser* parser) {
+  bool max_len = parser->Check("MAXLEN");
+  if (!max_len) {
+    parser->ExpectTag("MINID");
   }
 
-  return (*cntx)->SendError(UnknownSubCmd(sub_cmd, "XGROUP"));
+  auto res = ParseTrimOpts(max_len, parser);
+
+  if (parser->Check("MAXLEN") || parser->Check("MINID")) {
+    return CreateSyntaxError(kTrimOptionConflictErr);
+  }
+
+  return res;
 }
 
-void StreamFamily::XInfo(CmdArgList args, ConnectionContext* cntx) {
-  ToUpper(&args[0]);
-  string_view sub_cmd = ArgS(args, 0);
-  if (sub_cmd == "HELP") {
-    string_view help_arr[] = {
-        "CONSUMERS <key> <groupname>",
-        "    Show consumers of <groupname>.",
-        "GROUPS <key>",
-        "    Show the stream consumer groups.",
-        "STREAM <key> [FULL [COUNT <count>]",
-        "    Show information about the stream.",
-    };
-    return (*cntx)->SendSimpleStrArr(help_arr);
-  }
+ParseResult<AddOpts> ParseAddOpts(CmdArgParser* parser) {
+  AddOpts opts;
+  while (parser->HasNext()) {
+    if (parser->Check("NOMKSTREAM")) {
+      opts.no_mkstream = true;
+      continue;
+    }
 
-  if (args.size() >= 2) {
-    string_view key = ArgS(args, 1);
-    ShardId sid = Shard(key, shard_set->size());
-
-    if (sub_cmd == "GROUPS") {
-      // We do not use transactional xemantics for xinfo since it's informational command.
-      auto cb = [&]() {
-        EngineShard* shard = EngineShard::tlocal();
-        DbContext db_context{.db_index = cntx->db_index(), .time_now_ms = GetCurrentTimeMs()};
-        return OpListGroups(db_context, key, shard);
-      };
-
-      OpResult<vector<GroupInfo>> result = shard_set->Await(sid, std::move(cb));
-      if (result) {
-        (*cntx)->StartArray(result->size());
-        for (const auto& ginfo : *result) {
-          string last_id = StreamIdRepr(ginfo.last_id);
-
-          (*cntx)->StartCollection(4, RedisReplyBuilder::MAP);
-          (*cntx)->SendBulkString("name");
-          (*cntx)->SendBulkString(ginfo.name);
-          (*cntx)->SendBulkString("consumers");
-          (*cntx)->SendLong(ginfo.consumer_size);
-          (*cntx)->SendBulkString("pending");
-          (*cntx)->SendLong(ginfo.pending_size);
-          (*cntx)->SendBulkString("last-delivered-id");
-          (*cntx)->SendBulkString(last_id);
-        }
-        return;
+    bool max_len = parser->Check("MAXLEN");
+    if (max_len || parser->Check("MINID")) {
+      if (opts.trim_opts) {
+        return CreateSyntaxError(kTrimOptionConflictErr);
       }
-      return (*cntx)->SendError(result.status());
+
+      auto trim_opts = ParseTrimOpts(max_len, parser);
+      if (!trim_opts) {
+        return make_unexpected(trim_opts.error());
+      }
+
+      opts.trim_opts = trim_opts.value();  // trivial copy
+    } else {
+      // It is StreamId
+      std::string_view id = parser->Next();
+      if (!ParseID(id, true, 0, &opts.parsed_id)) {
+        return CreateSyntaxError(kInvalidStreamId);
+      }
+      break;
     }
   }
-  return (*cntx)->SendError(UnknownSubCmd(sub_cmd, "XINFO"));
+
+  return opts;
 }
 
-void StreamFamily::XLen(CmdArgList args, ConnectionContext* cntx) {
-  string_view key = ArgS(args, 0);
-  auto cb = [&](Transaction* t, EngineShard* shard) { return OpLen(t->GetOpArgs(shard), key); };
-
-  OpResult<uint32_t> result = cntx->transaction->ScheduleSingleHopT(std::move(cb));
-  if (result || result.status() == OpStatus::KEY_NOTFOUND) {
-    return (*cntx)->SendLong(*result);
+struct StreamReplies {
+  explicit StreamReplies(SinkReplyBuilder* rb) : rb{static_cast<RedisReplyBuilder*>(rb)} {
+    DCHECK(dynamic_cast<RedisReplyBuilder*>(rb));
   }
 
-  return (*cntx)->SendError(result.status());
-}
+  void SendRecord(const Record& record) const {
+    rb->StartArray(2);
+    rb->SendBulkString(StreamIdRepr(record.id));
+    rb->StartArray(record.kv_arr.size() * 2);
+    for (const auto& k_v : record.kv_arr) {
+      rb->SendBulkString(k_v.first);
+      rb->SendBulkString(k_v.second);
+    }
+  }
 
-void StreamFamily::XRange(CmdArgList args, ConnectionContext* cntx) {
-  XRangeGeneric(std::move(args), false, cntx);
-}
+  void SendIDs(absl::Span<const streamID> ids) const {
+    rb->StartArray(ids.size());
+    for (auto id : ids)
+      rb->SendBulkString(StreamIdRepr(id));
+  }
 
-void StreamFamily::XRevRange(CmdArgList args, ConnectionContext* cntx) {
-  swap(args[1], args[2]);
-  XRangeGeneric(std::move(args), true, cntx);
-}
+  void SendRecords(absl::Span<const Record> records) const {
+    rb->StartArray(records.size());
+    for (const auto& record : records)
+      SendRecord(record);
+  }
+
+  void SendStreamRecords(string_view key, absl::Span<const Record> records) const {
+    rb->SendBulkString(key);
+    SendRecords(records);
+  }
+
+  void SendClaimInfo(const ClaimInfo& ci) const {
+    if (ci.justid) {
+      SendIDs(ci.ids);
+    } else {
+      SendRecords(ci.records);
+    }
+  }
+
+  RedisReplyBuilder* rb;
+};
 
 std::optional<ReadOpts> ParseReadArgsOrReply(CmdArgList args, bool read_group,
-                                             ConnectionContext* cntx) {
+                                             SinkReplyBuilder* builder) {
   size_t streams_count = 0;
 
   ReadOpts opts;
@@ -1510,17 +2184,16 @@ std::optional<ReadOpts> ParseReadArgsOrReply(CmdArgList args, bool read_group,
   size_t id_indx = 0;
 
   if (opts.read_group) {
-    ToUpper(&args[id_indx]);
-    string_view arg = ArgS(args, id_indx);
+    string arg = absl::AsciiStrToUpper(ArgS(args, id_indx));
 
     if (arg.size() - 1 < 2) {
-      (*cntx)->SendError(kSyntaxErr);
+      builder->SendError(kSyntaxErr);
       return std::nullopt;
     }
 
     if (arg != "GROUP") {
       const auto m = "Missing 'GROUP' in 'XREADGROUP' command";
-      (*cntx)->SendError(m, kSyntaxErr);
+      builder->SendError(m, kSyntaxErr);
       return std::nullopt;
     }
     id_indx++;
@@ -1530,22 +2203,21 @@ std::optional<ReadOpts> ParseReadArgsOrReply(CmdArgList args, bool read_group,
   }
 
   for (; id_indx < args.size(); ++id_indx) {
-    ToUpper(&args[id_indx]);
-    string_view arg = ArgS(args, id_indx);
+    string arg = absl::AsciiStrToUpper(ArgS(args, id_indx));
 
     bool remaining_args = args.size() - id_indx - 1 > 0;
     if (arg == "BLOCK" && remaining_args) {
       id_indx++;
       arg = ArgS(args, id_indx);
       if (!absl::SimpleAtoi(arg, &opts.timeout)) {
-        (*cntx)->SendError(kInvalidIntErr);
+        builder->SendError(kInvalidIntErr);
         return std::nullopt;
       }
     } else if (arg == "COUNT" && remaining_args) {
       id_indx++;
       arg = ArgS(args, id_indx);
       if (!absl::SimpleAtoi(arg, &opts.count)) {
-        (*cntx)->SendError(kInvalidIntErr);
+        builder->SendError(kInvalidIntErr);
         return std::nullopt;
       }
     } else if (opts.read_group && arg == "NOACK") {
@@ -1555,21 +2227,25 @@ std::optional<ReadOpts> ParseReadArgsOrReply(CmdArgList args, bool read_group,
 
       size_t pair_count = args.size() - opts.streams_arg;
       if ((pair_count % 2) != 0) {
-        const auto m = "Unbalanced list of streams: for each stream key an ID must be specified";
-        (*cntx)->SendError(m, kSyntaxErr);
+        const char* cmd_name = read_group ? "xreadgroup" : "xread";
+        const char* symbol = read_group ? ">" : "$";
+        const auto msg = absl::StrCat("Unbalanced '", cmd_name,
+                                      "' list of streams: for each stream key an ID or '", symbol,
+                                      "' must be specified");
+        builder->SendError(msg, kSyntaxErr);
         return std::nullopt;
       }
       streams_count = pair_count / 2;
       break;
     } else {
-      (*cntx)->SendError(kSyntaxErr);
+      builder->SendError(kSyntaxErr);
       return std::nullopt;
     }
   }
 
   // STREAMS option is required.
   if (opts.streams_arg == 0) {
-    (*cntx)->SendError(kSyntaxErr);
+    builder->SendError(kSyntaxErr);
     return std::nullopt;
   }
 
@@ -1585,16 +2261,16 @@ std::optional<ReadOpts> ParseReadArgsOrReply(CmdArgList args, bool read_group,
       // Set ID to 0 so if the ID cannot be resolved (when the stream doesn't
       // exist) it takes the first entry added.
       if (opts.read_group) {
-        (*cntx)->SendError("The $ can be specified only when calling XREAD.", kSyntaxErr);
+        builder->SendError("The $ can be specified only when calling XREAD.", kSyntaxErr);
         return std::nullopt;
       }
       id.val.ms = 0;
       id.val.seq = 0;
-      id.last_id = true;
+      id.resolve_last_id = true;
       sitem.id = id;
       auto [_, is_inserted] = opts.stream_ids.emplace(key, sitem);
       if (!is_inserted) {
-        (*cntx)->SendError(kSameStreamFound);
+        builder->SendError(kSameStreamFound);
         return std::nullopt;
       }
       continue;
@@ -1602,7 +2278,7 @@ std::optional<ReadOpts> ParseReadArgsOrReply(CmdArgList args, bool read_group,
 
     if (idstr == ">") {
       if (!opts.read_group) {
-        (*cntx)->SendError(
+        builder->SendError(
             "The > ID can be specified only when calling XREADGROUP using the GROUP <group> "
             "<consumer> option.",
             kSyntaxErr);
@@ -1613,14 +2289,14 @@ std::optional<ReadOpts> ParseReadArgsOrReply(CmdArgList args, bool read_group,
       sitem.id = id;
       auto [_, is_inserted] = opts.stream_ids.emplace(key, sitem);
       if (!is_inserted) {
-        (*cntx)->SendError(kSameStreamFound);
+        builder->SendError(kSameStreamFound);
         return std::nullopt;
       }
       continue;
     }
 
     if (!ParseID(idstr, true, 0, &id)) {
-      (*cntx)->SendError(kInvalidStreamId, kSyntaxErrType);
+      builder->SendError(kInvalidStreamId, kSyntaxErrType);
       return std::nullopt;
     }
 
@@ -1630,56 +2306,111 @@ std::optional<ReadOpts> ParseReadArgsOrReply(CmdArgList args, bool read_group,
     sitem.id = id;
     auto [_, is_inserted] = opts.stream_ids.emplace(key, sitem);
     if (!is_inserted) {
-      (*cntx)->SendError(kSameStreamFound);
+      builder->SendError(kSameStreamFound);
       return std::nullopt;
     }
   }
   return opts;
 }
 
-// Returns the last ID of each stream in the transaction.
-OpResult<unordered_map<string_view, streamID>> StreamLastIDs(Transaction* trans) {
-  vector<OpResult<vector<pair<string_view, streamID>>>> last_ids_res(shard_set->size());
+void XRangeGeneric(std::string_view key, std::string_view start, std::string_view end,
+                   CmdArgList args, bool is_rev, Transaction* tx, SinkReplyBuilder* builder) {
+  RangeOpts range_opts;
+  RangeId rs, re;
+  if (!ParseRangeId(start, RangeBoundary::kStart, &rs) ||
+      !ParseRangeId(end, RangeBoundary::kEnd, &re)) {
+    return builder->SendError(kInvalidStreamId, kSyntaxErrType);
+  }
+
+  if (rs.exclude && streamIncrID(&rs.parsed_id.val) != C_OK) {
+    return builder->SendError("invalid start ID for the interval", kSyntaxErrType);
+  }
+
+  if (re.exclude && streamDecrID(&re.parsed_id.val) != C_OK) {
+    return builder->SendError("invalid end ID for the interval", kSyntaxErrType);
+  }
+
+  if (args.size() > 0) {
+    if (args.size() != 2) {
+      return builder->SendError(WrongNumArgsError("XRANGE"), kSyntaxErrType);
+    }
+
+    string opt = absl::AsciiStrToUpper(ArgS(args, 0));
+    string_view val = ArgS(args, 1);
+
+    if (opt != "COUNT" || !absl::SimpleAtoi(val, &range_opts.count)) {
+      return builder->SendError(kSyntaxErr);
+    }
+  }
+
+  range_opts.start = rs.parsed_id;
+  range_opts.end = re.parsed_id;
+  range_opts.is_rev = is_rev;
 
   auto cb = [&](Transaction* t, EngineShard* shard) {
-    ShardId sid = shard->shard_id();
-    last_ids_res[sid] = OpLastIDs(t->GetOpArgs(shard), t->GetShardArgs(shard->shard_id()));
-    return OpStatus::OK;
+    return OpRange(t->GetOpArgs(shard), key, range_opts);
   };
-  trans->Execute(std::move(cb), false);
 
-  unordered_map<string_view, streamID> last_ids;
-  for (auto res : last_ids_res) {
-    if (!res) {
-      return res.status();
-    }
-
-    for (auto& e : *res) {
-      last_ids.emplace(e.first, e.second);
-    }
+  OpResult<RecordVec> result = tx->ScheduleSingleHopT(cb);
+  auto* rb = static_cast<RedisReplyBuilder*>(builder);
+  if (result) {
+    SinkReplyBuilder::ReplyAggregator agg(builder);
+    StreamReplies{builder}.SendRecords(*result);
+    return;
   }
-  return last_ids;
+
+  if (result.status() == OpStatus::KEY_NOTFOUND) {
+    return rb->SendEmptyArray();
+  }
+  return builder->SendError(result.status());
 }
 
-void XReadBlock(ReadOpts opts, ConnectionContext* cntx) {
+void XReadBlock(ReadOpts* opts, Transaction* tx, SinkReplyBuilder* builder,
+                ConnectionContext* cntx) {
   // If BLOCK is not set just return an empty array as there are no resolvable
   // entries.
-  if (opts.timeout == -1 || cntx->transaction->IsMulti()) {
+  auto* rb = static_cast<RedisReplyBuilder*>(builder);
+  if (opts->timeout == -1 || tx->IsMulti()) {
     // Close the transaction and release locks.
-    auto close_cb = [&](Transaction* t, EngineShard* shard) { return OpStatus::OK; };
-    cntx->transaction->Execute(std::move(close_cb), true);
-    return (*cntx)->SendNullArray();
+    tx->Conclude();
+    return rb->SendNullArray();
   }
 
-  auto wcb = [](Transaction* t, EngineShard* shard) { return t->GetShardArgs(shard->shard_id()); };
+  auto tp = (opts->timeout) ? chrono::steady_clock::now() + chrono::milliseconds(opts->timeout)
+                            : Transaction::time_point::max();
 
-  auto tp = (opts.timeout) ? chrono::steady_clock::now() + chrono::milliseconds(opts.timeout)
-                           : Transaction::time_point::max();
+  const auto key_checker = [opts](EngineShard* owner, const DbContext& context, Transaction* tx,
+                                  std::string_view key) -> bool {
+    auto& db_slice = context.GetDbSlice(owner->shard_id());
+    auto res_it = db_slice.FindReadOnly(context, key, OBJ_STREAM);
+    if (!res_it.ok())
+      return false;
 
-  bool wait_succeeded = cntx->transaction->WaitOnWatch(tp, std::move(wcb));
-  if (!wait_succeeded) {
-    return (*cntx)->SendNullArray();
-  }
+    StreamIDsItem& sitem = opts->stream_ids.at(key);
+    if (sitem.id.val.ms != UINT64_MAX && sitem.id.val.seq != UINT64_MAX)
+      return true;
+
+    const CompactObj& cobj = (*res_it)->second;
+    stream* s = GetReadOnlyStream(cobj);
+    streamID last_id = s->last_id;
+    if (s->length) {
+      streamLastValidID(s, &last_id);
+    }
+
+    // Update group pointer and check it's validity
+    if (opts->read_group) {
+      sitem.group = streamLookupCG(s, WrapSds(opts->group_name));
+      if (!sitem.group)
+        return true;  // abort
+    }
+
+    return streamCompareID(&last_id, &sitem.group->last_id) > 0;
+  };
+
+  if (auto status =
+          tx->WaitOnWatch(tp, Transaction::kShardArgs, key_checker, &cntx->blocked, &cntx->paused);
+      status != OpStatus::OK)
+    return rb->SendNullArray();
 
   // Resolve the entry in the woken key. Note this must not use OpRead since
   // only the shard that contains the woken key blocks for the awoken
@@ -1693,337 +2424,1040 @@ void XReadBlock(ReadOpts opts, ConnectionContext* cntx) {
                                           .ms = UINT64_MAX,
                                           .seq = UINT64_MAX,
                                       }};
-      auto sitem = opts.stream_ids.at(*wake_key);
+      StreamIDsItem& sitem = opts->stream_ids.at(*wake_key);
       range_opts.start = sitem.id;
+
+      // Expect group to exist? No guarantees from transactional framework
+      if (opts->read_group && !sitem.group) {
+        result = OpStatus::INVALID_VALUE;
+        return OpStatus::OK;
+      }
+
+      if (sitem.id.val.ms == UINT64_MAX || sitem.id.val.seq == UINT64_MAX) {
+        range_opts.start.val = sitem.group->last_id;  // only for '>'
+        streamIncrID(&range_opts.start.val);
+      }
+
       range_opts.group = sitem.group;
-      range_opts.consumer = sitem.consumer;
-      range_opts.noack = opts.noack;
+
+      // Update consumer
+      if (sitem.group) {
+        range_opts.consumer =
+            FindOrAddConsumer(opts->consumer_name, sitem.group, GetCurrentTimeMs());
+        sitem.consumer = range_opts.consumer;
+        if (!sitem.consumer) {
+          return OpStatus::OUT_OF_MEMORY;
+        }
+
+        if (sitem.consumer->pel->numnodes == 0) {
+          LOG(DFATAL) << "Internal error when accessing consumer data, seen_time "
+                      << sitem.consumer->seen_time;
+          result = OpStatus::CANCELLED;
+          return OpStatus::OK;
+        }
+      }
+
+      range_opts.noack = opts->noack;
 
       result = OpRange(t->GetOpArgs(shard), *wake_key, range_opts);
       key = *wake_key;
     }
     return OpStatus::OK;
   };
-  cntx->transaction->Execute(std::move(range_cb), true);
+  tx->Execute(std::move(range_cb), true);
 
   if (result) {
-    SinkReplyBuilder::ReplyAggregator agg(cntx->reply_builder());
-
-    (*cntx)->StartArray(1);
-
-    (*cntx)->StartArray(2);
-    (*cntx)->SendBulkString(key);
-
-    (*cntx)->StartArray(result->size());
-    for (const auto& item : *result) {
-      (*cntx)->StartArray(2);
-      (*cntx)->SendBulkString(StreamIdRepr(item.id));
-      (*cntx)->StartArray(item.kv_arr.size() * 2);
-      for (const auto& k_v : item.kv_arr) {
-        (*cntx)->SendBulkString(k_v.first);
-        (*cntx)->SendBulkString(k_v.second);
-      }
+    SinkReplyBuilder::ReplyAggregator agg(rb);
+    if (opts->read_group && rb->IsResp3()) {
+      rb->StartCollection(1, RedisReplyBuilder::CollectionType::MAP);
+    } else {
+      rb->StartArray(1);
+      rb->StartArray(2);
     }
-    return;
-  } else {
-    return (*cntx)->SendNullArray();
+    return StreamReplies{rb}.SendStreamRecords(key, *result);
+  } else if (result.status() == OpStatus::INVALID_VALUE) {
+    return rb->SendError("NOGROUP the consumer group this client was blocked on no longer exists");
   }
+  return rb->SendNullArray();
 }
 
-// Read entries from given streams
-void XReadImpl(CmdArgList args, std::optional<ReadOpts> opts, ConnectionContext* cntx) {
-  auto last_ids = StreamLastIDs(cntx->transaction);
-  if (!last_ids) {
-    // Close the transaction.
-    auto close_cb = [&](Transaction* t, EngineShard* shard) { return OpStatus::OK; };
-    cntx->transaction->Execute(std::move(close_cb), true);
+void XReadGeneric2(CmdArgList args, bool read_group, Transaction* tx, SinkReplyBuilder* builder,
+                   ConnectionContext* cntx) {
+  optional<ReadOpts> opts = ParseReadArgsOrReply(args, read_group, builder);
+  if (!opts)
+    return;
 
-    if (last_ids.status() == OpStatus::WRONG_TYPE) {
-      (*cntx)->SendError(kWrongTypeErr);
-      return;
+  // Determine if streams have entries or any error occured
+  AggregateValue<optional<facade::ErrorReply>> err;
+  atomic_bool have_entries = false;
+
+  // With a single shard we can call OpRead in a single hop, falling back to
+  // avoid concluding if no entries are available.
+  bool try_fastread = tx->GetUniqueShardCnt() == 1;
+  vector<RecordVec> fastread_prefetched;
+
+  auto cb = [&](auto* tx, auto* es) -> Transaction::RunnableResult {
+    auto op_args = tx->GetOpArgs(es);
+    for (string_view skey : tx->GetShardArgs(es->shard_id())) {
+      if (auto res = HasEntries2(op_args, skey, &*opts); holds_alternative<facade::ErrorReply>(res))
+        err = get<facade::ErrorReply>(res);
+      else if (holds_alternative<bool>(res) && get<bool>(res))
+        have_entries.store(true, memory_order_relaxed);
     }
 
-    return (*cntx)->SendNullArray();
-  }
-
-  // Resolve '$' IDs and check if there are any streams with entries that can
-  // be resolved without blocking.
-  bool block = true;
-  for (auto& [stream, requested_sitem] : opts->stream_ids) {
-    if (auto last_id_it = last_ids->find(stream); last_id_it != last_ids->end()) {
-      streamID last_id = last_id_it->second;
-
-      if (opts->read_group && !requested_sitem.group) {
-        // if the group associated with the key is not found,
-        // we will not read entries from the key.
-        continue;
-      }
-
-      // Resolve $ to the last ID in the stream.
-      if (requested_sitem.id.last_id && !opts->read_group) {
-        requested_sitem.id.val = last_id;
-        // We only include messages with IDs greater than the last message so
-        // increment the ID.
-        streamIncrID(&requested_sitem.id.val);
-        requested_sitem.id.last_id = false;
-        continue;
-      }
-      if (opts->read_group) {
-        // If '>' is not provided, consumer PEL is used. So don't need to block.
-        if (requested_sitem.id.val.ms != UINT64_MAX || requested_sitem.id.val.seq != UINT64_MAX) {
-          block = false;
-          opts->serve_history = true;
-          continue;
-        }
-        requested_sitem.id.val = requested_sitem.group->last_id;
-        streamIncrID(&requested_sitem.id.val);
-      }
-
-      if (streamCompareID(&last_id, &requested_sitem.id.val) >= 0) {
-        block = false;
-      }
+    if (try_fastread) {
+      if (have_entries.load(memory_order_relaxed))
+        fastread_prefetched = OpRead(tx->GetOpArgs(es), tx->GetShardArgs(es->shard_id()), *opts);
+      else
+        return {OpStatus::OK, Transaction::RunnableResult::AVOID_CONCLUDING};
     }
-  }
-
-  if (block) {
-    return XReadBlock(*opts, cntx);
-  }
-
-  vector<vector<RecordVec>> xread_resp(shard_set->size());
-  auto read_cb = [&](Transaction* t, EngineShard* shard) {
-    ShardId sid = shard->shard_id();
-    xread_resp[sid] = OpRead(t->GetOpArgs(shard), t->GetShardArgs(shard->shard_id()), *opts);
     return OpStatus::OK;
   };
-  cntx->transaction->Execute(std::move(read_cb), true);
+  tx->Execute(cb, try_fastread);
 
-  // Merge the results into a single response ordered by stream.
-  vector<RecordVec> res(opts->stream_ids.size());
-  // Track the number of streams with records as empty streams are excluded from
-  // the response.
+  if (err) {
+    tx->Conclude();
+    return builder->SendError(**err);
+  }
+
+  if (!have_entries.load(memory_order_relaxed))
+    return XReadBlock(&*opts, tx, builder, cntx);
+
+  vector<vector<RecordVec>> xread_resp;
+  if (try_fastread && have_entries.load(memory_order_relaxed)) {
+    xread_resp = {std::move(fastread_prefetched)};
+  } else {
+    xread_resp.resize(shard_set->size());
+    auto read_cb = [&](Transaction* t, EngineShard* shard) {
+      ShardId sid = shard->shard_id();
+      xread_resp[sid] = OpRead(t->GetOpArgs(shard), t->GetShardArgs(sid), *opts);
+      return OpStatus::OK;
+    };
+    tx->Execute(std::move(read_cb), true);
+  }
+
+  // Count number of streams and merge final results in correct order
   int resolved_streams = 0;
-  for (ShardId sid = 0; sid < shard_set->size(); ++sid) {
-    if (!cntx->transaction->IsActive(sid))
+  vector<RecordVec> results(opts->stream_ids.size());
+  for (size_t i = 0; i < xread_resp.size(); i++) {
+    vector<RecordVec>& sub_results = xread_resp[i];
+    ShardId sid = xread_resp.size() < shard_set->size() ? tx->GetUniqueShard() : i;
+    if (!tx->IsActive(sid)) {
+      DCHECK(sub_results.empty());
       continue;
+    }
 
-    vector<RecordVec>& results = xread_resp[sid];
+    ShardArgs shard_args = tx->GetShardArgs(sid);
+    DCHECK_EQ(shard_args.Size(), sub_results.size());
 
-    ArgSlice slice = cntx->transaction->GetShardArgs(sid);
-
-    DCHECK(!slice.empty());
-    DCHECK_EQ(slice.size(), results.size());
-
-    for (size_t i = 0; i < slice.size(); ++i) {
-      if (results[i].size() == 0) {
+    auto shard_args_it = shard_args.begin();
+    for (size_t j = 0; j < sub_results.size(); j++, ++shard_args_it) {
+      if (sub_results[j].empty())
         continue;
-      }
 
       resolved_streams++;
-
-      // Add the stream records ordered by the original stream arguments.
-      size_t indx = cntx->transaction->ReverseArgIndex(sid, i);
-      res[indx - opts->streams_arg] = std::move(results[i]);
+      results[shard_args_it.index() - opts->streams_arg] = std::move(sub_results[j]);
     }
   }
 
-  SinkReplyBuilder::ReplyAggregator agg(cntx->reply_builder());
-
-  (*cntx)->StartArray(resolved_streams);
-  for (size_t i = 0; i != res.size(); i++) {
-    // Ignore empty streams.
-    if (res[i].size() == 0) {
-      continue;
-    }
-
-    (*cntx)->StartArray(2);
-    (*cntx)->SendBulkString(ArgS(args, i + opts->streams_arg));
-    (*cntx)->StartArray(res[i].size());
-    for (const auto& item : res[i]) {
-      (*cntx)->StartArray(2);
-      (*cntx)->SendBulkString(StreamIdRepr(item.id));
-      (*cntx)->StartArray(item.kv_arr.size() * 2);
-      for (const auto& k_v : item.kv_arr) {
-        (*cntx)->SendBulkString(k_v.first);
-        (*cntx)->SendBulkString(k_v.second);
+  // Send all results back
+  auto* rb = static_cast<RedisReplyBuilder*>(builder);
+  SinkReplyBuilder::ReplyAggregator agg(builder);
+  if (opts->read_group) {
+    if (rb->IsResp3()) {
+      rb->StartCollection(opts->stream_ids.size(), RedisReplyBuilder::CollectionType::MAP);
+      for (size_t i = 0; i < opts->stream_ids.size(); i++) {
+        string_view key = ArgS(args, i + opts->streams_arg);
+        StreamReplies{builder}.SendStreamRecords(key, results[i]);
       }
+    } else {
+      rb->StartArray(opts->stream_ids.size());
+      for (size_t i = 0; i < opts->stream_ids.size(); i++) {
+        string_view key = ArgS(args, i + opts->streams_arg);
+        rb->StartArray(2);
+        StreamReplies{builder}.SendStreamRecords(key, results[i]);
+      }
+    }
+  } else {
+    rb->StartArray(resolved_streams);
+    for (size_t i = 0; i < results.size(); i++) {
+      if (results[i].empty())
+        continue;
+      string_view key = ArgS(args, i + opts->streams_arg);
+      rb->StartArray(2);
+      StreamReplies{builder}.SendStreamRecords(key, results[i]);
     }
   }
 }
 
-void XReadGeneric(CmdArgList args, bool read_group, ConnectionContext* cntx) {
-  auto opts = ParseReadArgsOrReply(args, read_group, cntx);
-  if (!opts) {
+void HelpSubCmd(facade::CmdArgParser* parser, Transaction* tx, SinkReplyBuilder* builder) {
+  XGroupHelp(parser->Tail(), CommandContext{tx, builder, nullptr});
+}
+
+bool ParseXpendingOptions(CmdArgList& args, PendingOpts& opts, SinkReplyBuilder* builder) {
+  size_t id_indx = 0;
+  string arg = absl::AsciiStrToUpper(ArgS(args, id_indx));
+
+  if (arg == "IDLE" && args.size() > 4) {
+    id_indx++;
+    if (!absl::SimpleAtoi(ArgS(args, id_indx), &opts.min_idle_time)) {
+      builder->SendError(kInvalidIntErr, kSyntaxErrType);
+      return false;
+    }
+    // Ignore negative min_idle_time
+    opts.min_idle_time = std::max(opts.min_idle_time, static_cast<int64_t>(0));
+    args.remove_prefix(2);
+    id_indx = 0;
+  }
+  if (args.size() < 3) {
+    builder->SendError(WrongNumArgsError("XPENDING"), kSyntaxErrType);
+    return false;
+  }
+
+  // Parse start and end
+  RangeId rs, re;
+  string_view start = ArgS(args, id_indx);
+  id_indx++;
+  string_view end = ArgS(args, id_indx);
+  if (!ParseRangeId(start, RangeBoundary::kStart, &rs) ||
+      !ParseRangeId(end, RangeBoundary::kEnd, &re)) {
+    builder->SendError(kInvalidStreamId, kSyntaxErrType);
+    return false;
+  }
+
+  if (rs.exclude && streamIncrID(&rs.parsed_id.val) != C_OK) {
+    builder->SendError("invalid start ID for the interval", kSyntaxErrType);
+    return false;
+  }
+
+  if (re.exclude && streamDecrID(&re.parsed_id.val) != C_OK) {
+    builder->SendError("invalid end ID for the interval", kSyntaxErrType);
+    return false;
+  }
+  id_indx++;
+  opts.start = rs.parsed_id;
+  opts.end = re.parsed_id;
+
+  // Parse count
+  if (!absl::SimpleAtoi(ArgS(args, id_indx), &opts.count)) {
+    builder->SendError(kInvalidIntErr, kSyntaxErrType);
+    return false;
+  }
+
+  // Ignore negative count value
+  opts.count = std::max(opts.count, static_cast<int64_t>(0));
+  if (args.size() - id_indx - 1) {
+    id_indx++;
+    opts.consumer_name = ArgS(args, id_indx);
+  }
+  return true;
+}
+
+}  // namespace
+
+void StreamFamily::XAdd(CmdArgList args, const CommandContext& cmd_cntx) {
+  CmdArgParser parser{args};
+  auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx.rb);
+
+  string_view key = parser.Next();
+
+  auto parsed_add_opts = ParseAddOpts(&parser);
+
+  if (auto err = parser.Error(); err || !parsed_add_opts) {
+    rb->SendError(!parsed_add_opts ? parsed_add_opts.error() : err->MakeReply());
     return;
   }
 
-  vector<vector<GroupConsumerPair>> res_pairs(shard_set->size());
+  // Save the index of the stream ID in the arguments list.
+  // We need this during journaling
+  // It is (parser.GetCurrentIndex() - 1) because the stream id is the last parsed argument in the
+  // ParseAddOpts
+  const size_t stream_id_index_in_args = parser.GetCurrentIndex() - 1;
+  AddArgsJournaler journaler{{args.begin(), args.end()}, stream_id_index_in_args};
+
+  CmdArgList fields = parser.Tail();
+  if (fields.empty() || fields.size() % 2 != 0) {
+    return rb->SendError(WrongNumArgsError("XADD"), kSyntaxErrType);
+  }
+
   auto cb = [&](Transaction* t, EngineShard* shard) {
-    auto sid = shard->shard_id();
-    auto s_args = t->GetShardArgs(sid);
-    GroupConsumerPairOpts gc_opts = {opts->group_name, opts->consumer_name};
-
-    res_pairs[sid] = OpGetGroupConsumerPairs(s_args, t->GetOpArgs(shard), gc_opts);
-    return OpStatus::OK;
+    return OpAdd(t->GetOpArgs(shard), key, parsed_add_opts.value(), fields, journaler);
   };
-  cntx->transaction->Schedule();
-  if (opts->read_group) {
-    // If the command is `XReadGroup`, we need to get
-    // the (group, consumer) pairs for each key.
-    cntx->transaction->Execute(std::move(cb), false);
 
-    for (size_t i = 0; i < shard_set->size(); i++) {
-      auto s_item = res_pairs[i];
-      auto s_args = cntx->transaction->GetShardArgs(i);
-      if (s_item.size() == 0) {
-        continue;
-      }
-      for (size_t j = 0; j < s_args.size(); j++) {
-        string_view key = s_args[j];
-        StreamIDsItem& item = opts->stream_ids.at(key);
-        item.consumer = s_item[j].consumer;
-        item.group = s_item[j].group;
-      }
+  OpResult<streamID> add_result = cmd_cntx.tx->ScheduleSingleHopT(cb);
+
+  if (add_result) {
+    rb->SendBulkString(StreamIdRepr(*add_result));
+  } else {
+    if (add_result == OpStatus::KEY_NOTFOUND) {
+      rb->SendNull();
+    } else if (add_result == OpStatus::STREAM_ID_SMALL) {
+      rb->SendError(LeqTopIdError("XADD"));
+    } else {
+      rb->SendError(add_result.status());
     }
   }
-  return XReadImpl(args, opts, cntx);
 }
 
-void StreamFamily::XRead(CmdArgList args, ConnectionContext* cntx) {
-  return XReadGeneric(args, false, cntx);
+absl::InlinedVector<streamID, 8> GetXclaimIds(CmdArgList& args) {
+  size_t i;
+  absl::InlinedVector<streamID, 8> ids;
+  for (i = 0; i < args.size(); ++i) {
+    ParsedStreamId parsed_id;
+    string_view str_id = ArgS(args, i);
+    if (!ParseID(str_id, true, 0, &parsed_id)) {
+      if (i > 0) {
+        break;
+      }
+      return ids;
+    }
+    ids.push_back(parsed_id.val);
+  }
+  args.remove_prefix(i);
+  return ids;
 }
 
-void StreamFamily::XReadGroup(CmdArgList args, ConnectionContext* cntx) {
-  return XReadGeneric(args, true, cntx);
+bool ParseXclaimOptions(CmdArgList& args, ClaimOpts& opts, SinkReplyBuilder* builder) {
+  for (size_t i = 0; i < args.size(); ++i) {
+    string arg = absl::AsciiStrToUpper(ArgS(args, i));
+    bool remaining_args = args.size() - i - 1 > 0;
+
+    if (remaining_args) {
+      if (arg == "IDLE") {
+        arg = ArgS(args, ++i);
+        if (!absl::SimpleAtoi(arg, &opts.delivery_time)) {
+          builder->SendError(kInvalidIntErr);
+          return false;
+        }
+        continue;
+      } else if (arg == "TIME") {
+        arg = ArgS(args, ++i);
+        if (!absl::SimpleAtoi(arg, &opts.delivery_time)) {
+          builder->SendError(kInvalidIntErr);
+          return false;
+        }
+        continue;
+      } else if (arg == "RETRYCOUNT") {
+        arg = ArgS(args, ++i);
+        if (!absl::SimpleAtoi(arg, &opts.retry)) {
+          builder->SendError(kInvalidIntErr);
+          return false;
+        }
+        continue;
+      } else if (arg == "LASTID") {
+        opts.flags |= kClaimLastID;
+        arg = ArgS(args, ++i);
+        ParsedStreamId parsed_id;
+        if (ParseID(arg, true, 0, &parsed_id)) {
+          opts.last_id = parsed_id.val;
+        } else {
+          builder->SendError(kInvalidStreamId, kSyntaxErrType);
+          return false;
+        }
+        continue;
+      }
+    }
+    if (arg == "FORCE") {
+      opts.flags |= kClaimForce;
+    } else if (arg == "JUSTID") {
+      opts.flags |= kClaimJustID;
+    } else {
+      builder->SendError("Unknown argument given for XCLAIM command", kSyntaxErr);
+      return false;
+    }
+  }
+  return true;
 }
 
-void StreamFamily::XSetId(CmdArgList args, ConnectionContext* cntx) {
+void StreamFamily::XClaim(CmdArgList args, const CommandContext& cmd_cntx) {
+  ClaimOpts opts;
+  string_view key = ArgS(args, 0);
+  opts.group = ArgS(args, 1);
+  opts.consumer = ArgS(args, 2);
+  if (!absl::SimpleAtoi(ArgS(args, 3), &opts.min_idle_time)) {
+    return cmd_cntx.rb->SendError(kSyntaxErr);
+  }
+  // Ignore negative min-idle-time
+  opts.min_idle_time = std::max(opts.min_idle_time, static_cast<int64>(0));
+  args.remove_prefix(4);
+
+  auto ids = GetXclaimIds(args);
+  if (ids.empty()) {
+    // No ids given.
+    return cmd_cntx.rb->SendError(kInvalidStreamId, kSyntaxErrType);
+  }
+
+  // parse the options
+  if (!ParseXclaimOptions(args, opts, cmd_cntx.rb))
+    return;
+
+  if (uint64_t now = cmd_cntx.tx->GetDbContext().time_now_ms;
+      opts.delivery_time < 0 || static_cast<uint64_t>(opts.delivery_time) > now)
+    opts.delivery_time = now;
+
+  auto cb = [&](Transaction* t, EngineShard* shard) {
+    return OpClaim(t->GetOpArgs(shard), key, opts, absl::Span{ids.data(), ids.size()});
+  };
+  OpResult<ClaimInfo> result = cmd_cntx.tx->ScheduleSingleHopT(std::move(cb));
+  if (!result) {
+    cmd_cntx.rb->SendError(result.status());
+    return;
+  }
+
+  StreamReplies{cmd_cntx.rb}.SendClaimInfo(result.value());
+}
+
+void StreamFamily::XDel(CmdArgList args, const CommandContext& cmd_cntx) {
+  string_view key = ArgS(args, 0);
+  args.remove_prefix(1);
+
+  absl::InlinedVector<streamID, 8> ids(args.size());
+
+  for (size_t i = 0; i < args.size(); ++i) {
+    ParsedStreamId parsed_id;
+    string_view str_id = ArgS(args, i);
+    if (!ParseID(str_id, true, 0, &parsed_id)) {
+      return cmd_cntx.rb->SendError(kInvalidStreamId, kSyntaxErrType);
+    }
+    ids[i] = parsed_id.val;
+  }
+
+  auto cb = [&](Transaction* t, EngineShard* shard) {
+    return OpDel(t->GetOpArgs(shard), key, absl::Span{ids.data(), ids.size()});
+  };
+
+  OpResult<uint32_t> result = cmd_cntx.tx->ScheduleSingleHopT(cb);
+  if (result || result.status() == OpStatus::KEY_NOTFOUND) {
+    return cmd_cntx.rb->SendLong(*result);
+  }
+
+  cmd_cntx.rb->SendError(result.status());
+}
+
+void StreamFamily::XGroup(CmdArgList args, const CommandContext& cmd_cntx) {
+  facade::CmdArgParser parser{args};
+
+  auto sub_cmd_func = parser.MapNext("HELP", &HelpSubCmd, "CREATE", &CreateGroup, "DESTROY",
+                                     &DestroyGroup, "CREATECONSUMER", &CreateConsumer,
+                                     "DELCONSUMER", &DelConsumer, "SETID", &SetId);
+
+  if (auto err = parser.Error(); err)
+    return cmd_cntx.rb->SendError(err->MakeReply());
+
+  sub_cmd_func(&parser, cmd_cntx.tx, cmd_cntx.rb);
+}
+
+void StreamFamily::XInfo(CmdArgList args, const CommandContext& cmd_cntx) {
+  auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx.rb);
+  string sub_cmd = absl::AsciiStrToUpper(ArgS(args, 0));
+
+  if (sub_cmd == "HELP") {
+    string_view help_arr[] = {"CONSUMERS <key> <groupname>",
+                              "    Show consumers of <groupname>.",
+                              "GROUPS <key>",
+                              "    Show the stream consumer groups.",
+                              "STREAM <key> [FULL [COUNT <count>]",
+                              "    Show information about the stream.",
+                              "HELP",
+                              "    Prints this help."};
+    return rb->SendSimpleStrArr(help_arr);
+  }
+
+  if (args.size() >= 2) {
+    string_view key = ArgS(args, 1);
+    ShardId sid = Shard(key, shard_set->size());
+
+    if (sub_cmd == "GROUPS") {
+      // We do not use transactional xemantics for xinfo since it's informational command.
+      auto cb = [&]() {
+        EngineShard* shard = EngineShard::tlocal();
+        DbContext db_context{cmd_cntx.conn_cntx->ns, cmd_cntx.conn_cntx->db_index(),
+                             GetCurrentTimeMs()};
+        return OpListGroups(db_context, key, shard);
+      };
+
+      OpResult<vector<GroupInfo>> result = shard_set->Await(sid, std::move(cb));
+      if (result) {
+        rb->StartArray(result->size());
+        for (const auto& ginfo : *result) {
+          string last_id = StreamIdRepr(ginfo.last_id);
+
+          rb->StartCollection(6, RedisReplyBuilder::MAP);
+          rb->SendBulkString("name");
+          rb->SendBulkString(ginfo.name);
+          rb->SendBulkString("consumers");
+          rb->SendLong(ginfo.consumer_size);
+          rb->SendBulkString("pending");
+          rb->SendLong(ginfo.pending_size);
+          rb->SendBulkString("last-delivered-id");
+          rb->SendBulkString(last_id);
+          rb->SendBulkString("entries-read");
+          if (ginfo.entries_read != SCG_INVALID_ENTRIES_READ) {
+            rb->SendLong(ginfo.entries_read);
+          } else {
+            rb->SendNull();
+          }
+          rb->SendBulkString("lag");
+          if (ginfo.lag != SCG_INVALID_LAG) {
+            rb->SendLong(ginfo.lag);
+          } else {
+            rb->SendNull();
+          }
+        }
+        return;
+      }
+      return rb->SendError(result.status());
+    } else if (sub_cmd == "STREAM") {
+      int full = 0;
+      size_t count = 10;  // default count for xinfo streams
+
+      if (args.size() == 4 || args.size() > 5) {
+        return rb->SendError(
+            "unknown subcommand or wrong number of arguments for 'STREAM'. Try XINFO HELP.");
+      }
+
+      if (args.size() >= 3) {
+        full = 1;
+        string full_arg = absl::AsciiStrToUpper(ArgS(args, 2));
+        if (full_arg != "FULL") {
+          return rb->SendError(
+              "unknown subcommand or wrong number of arguments for 'STREAM'. Try XINFO HELP.");
+        }
+        if (args.size() > 3) {
+          string count_arg = absl::AsciiStrToUpper(ArgS(args, 3));
+          string_view count_value_arg = ArgS(args, 4);
+          if (count_arg != "COUNT") {
+            return rb->SendError(
+                "unknown subcommand or wrong number of arguments for 'STREAM'. Try XINFO HELP.");
+          }
+
+          if (!absl::SimpleAtoi(count_value_arg, &count)) {
+            return rb->SendError(kInvalidIntErr);
+          }
+        }
+      }
+
+      auto cb = [&]() {
+        EngineShard* shard = EngineShard::tlocal();
+        return OpStreams(
+            DbContext{cmd_cntx.conn_cntx->ns, cmd_cntx.conn_cntx->db_index(), GetCurrentTimeMs()},
+            key, shard, full, count);
+      };
+
+      OpResult<StreamInfo> sinfo = shard_set->Await(sid, std::move(cb));
+      if (sinfo) {
+        if (full) {
+          rb->StartCollection(9, RedisReplyBuilder::MAP);
+        } else {
+          rb->StartCollection(10, RedisReplyBuilder::MAP);
+        }
+
+        rb->SendBulkString("length");
+        rb->SendLong(sinfo->length);
+
+        rb->SendBulkString("radix-tree-keys");
+        rb->SendLong(sinfo->radix_tree_keys);
+
+        rb->SendBulkString("radix-tree-nodes");
+        rb->SendLong(sinfo->radix_tree_nodes);
+
+        rb->SendBulkString("last-generated-id");
+        rb->SendBulkString(StreamIdRepr(sinfo->last_generated_id));
+
+        rb->SendBulkString("max-deleted-entry-id");
+        rb->SendBulkString(StreamIdRepr(sinfo->max_deleted_entry_id));
+
+        rb->SendBulkString("entries-added");
+        rb->SendLong(sinfo->entries_added);
+
+        rb->SendBulkString("recorded-first-entry-id");
+        rb->SendBulkString(StreamIdRepr(sinfo->recorded_first_entry_id));
+
+        if (full) {
+          rb->SendBulkString("entries");
+          StreamReplies{rb}.SendRecords(sinfo->entries);
+
+          rb->SendBulkString("groups");
+          rb->StartArray(sinfo->cgroups.size());
+          for (const auto& ginfo : sinfo->cgroups) {
+            rb->StartCollection(7, RedisReplyBuilder::MAP);
+
+            rb->SendBulkString("name");
+            rb->SendBulkString(ginfo.name);
+
+            rb->SendBulkString("last-delivered-id");
+            rb->SendBulkString(StreamIdRepr(ginfo.last_id));
+
+            rb->SendBulkString("entries-read");
+            if (ginfo.entries_read != SCG_INVALID_ENTRIES_READ) {
+              rb->SendLong(ginfo.entries_read);
+            } else {
+              rb->SendNull();
+            }
+            rb->SendBulkString("lag");
+            if (ginfo.lag != SCG_INVALID_LAG) {
+              rb->SendLong(ginfo.lag);
+            } else {
+              rb->SendNull();
+            }
+
+            rb->SendBulkString("pel-count");
+            rb->SendLong(ginfo.pending_size);
+
+            rb->SendBulkString("pending");
+            rb->StartArray(ginfo.stream_nack_vec.size());
+            for (const auto& pending_info : ginfo.stream_nack_vec) {
+              rb->StartArray(4);
+              rb->SendBulkString(StreamIdRepr(pending_info.pel_id));
+              rb->SendBulkString(pending_info.consumer_name);
+              rb->SendLong(pending_info.delivery_time);
+              rb->SendLong(pending_info.delivery_count);
+            }
+
+            rb->SendBulkString("consumers");
+            rb->StartArray(ginfo.consumer_info_vec.size());
+            for (const auto& consumer_info : ginfo.consumer_info_vec) {
+              rb->StartCollection(5, RedisReplyBuilder::MAP);
+
+              rb->SendBulkString("name");
+              rb->SendBulkString(consumer_info.name);
+
+              rb->SendBulkString("seen-time");
+              rb->SendLong(consumer_info.seen_time);
+
+              rb->SendBulkString("active-time");
+              rb->SendLong(consumer_info.active_time);
+
+              rb->SendBulkString("pel-count");
+              rb->SendLong(consumer_info.pel_count);
+
+              rb->SendBulkString("pending");
+              if (consumer_info.pending.size() == 0) {
+                rb->SendEmptyArray();
+              } else {
+                rb->StartArray(consumer_info.pending.size());
+              }
+              for (const auto& pending : consumer_info.pending) {
+                rb->StartArray(3);
+
+                rb->SendBulkString(StreamIdRepr(pending.pel_id));
+                rb->SendLong(pending.delivery_time);
+                rb->SendLong(pending.delivery_count);
+              }
+            }
+          }
+        } else {
+          rb->SendBulkString("groups");
+          rb->SendLong(sinfo->groups);
+
+          rb->SendBulkString("first-entry");
+          if (sinfo->first_entry.kv_arr.size() != 0) {
+            StreamReplies{rb}.SendRecord(sinfo->first_entry);
+          } else {
+            rb->SendNullArray();
+          }
+
+          rb->SendBulkString("last-entry");
+          if (sinfo->last_entry.kv_arr.size() != 0) {
+            StreamReplies{rb}.SendRecord(sinfo->last_entry);
+          } else {
+            rb->SendNullArray();
+          }
+        }
+        return;
+      }
+      return rb->SendError(sinfo.status());
+    } else if (sub_cmd == "CONSUMERS") {
+      string_view stream_name = ArgS(args, 1);
+      string_view group_name = ArgS(args, 2);
+      auto cb = [&]() {
+        return OpConsumers(
+            DbContext{cmd_cntx.conn_cntx->ns, cmd_cntx.conn_cntx->db_index(), GetCurrentTimeMs()},
+            EngineShard::tlocal(), stream_name, group_name);
+      };
+
+      OpResult<vector<ConsumerInfo>> result = shard_set->Await(sid, std::move(cb));
+      if (result) {
+        rb->StartArray(result->size());
+        int64_t now_ms = GetCurrentTimeMs();
+        for (const auto& consumer_info : *result) {
+          int64_t active = consumer_info.active_time;
+          int64_t inactive = active != -1 ? now_ms - active : -1;
+
+          rb->StartCollection(4, RedisReplyBuilder::MAP);
+          rb->SendBulkString("name");
+          rb->SendBulkString(consumer_info.name);
+          rb->SendBulkString("pending");
+          rb->SendLong(consumer_info.pel_count);
+          rb->SendBulkString("idle");
+          rb->SendLong(consumer_info.idle);
+          rb->SendBulkString("inactive");
+          rb->SendLong(inactive);
+        }
+        return;
+      }
+      if (result.status() == OpStatus::INVALID_VALUE) {
+        return rb->SendError(NoGroupError(stream_name, group_name));
+      }
+      return rb->SendError(result.status());
+    }
+  }
+  return rb->SendError(UnknownSubCmd(sub_cmd, "XINFO"));
+}
+
+void StreamFamily::XLen(CmdArgList args, const CommandContext& cmd_cntx) {
+  string_view key = ArgS(args, 0);
+  auto cb = [&](Transaction* t, EngineShard* shard) { return OpLen(t->GetOpArgs(shard), key); };
+
+  OpResult<uint32_t> result = cmd_cntx.tx->ScheduleSingleHopT(cb);
+  if (result || result.status() == OpStatus::KEY_NOTFOUND) {
+    return cmd_cntx.rb->SendLong(*result);
+  }
+
+  return cmd_cntx.rb->SendError(result.status());
+}
+
+void StreamFamily::XPending(CmdArgList args, const CommandContext& cmd_cntx) {
+  string_view key = ArgS(args, 0);
+  PendingOpts opts;
+  opts.group_name = ArgS(args, 1);
+  args.remove_prefix(2);
+
+  auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx.rb);
+  if (!args.empty() && !ParseXpendingOptions(args, opts, rb)) {
+    return;
+  }
+
+  auto cb = [&](Transaction* t, EngineShard* shard) {
+    return OpPending(t->GetOpArgs(shard), key, opts);
+  };
+  OpResult<PendingResult> op_result = cmd_cntx.tx->ScheduleSingleHopT(cb);
+  if (!op_result) {
+    if (op_result.status() == OpStatus::SKIPPED)
+      return rb->SendError(NoGroupError(key, opts.group_name));
+    return rb->SendError(op_result.status());
+  }
+  const PendingResult& result = op_result.value();
+
+  if (std::holds_alternative<PendingReducedResult>(result)) {
+    const auto& res = std::get<PendingReducedResult>(result);
+    rb->StartArray(4);
+    rb->SendLong(res.count);
+    if (res.count) {
+      rb->SendBulkString(StreamIdRepr(res.start));
+      rb->SendBulkString(StreamIdRepr(res.end));
+      rb->StartArray(res.consumer_list.size());
+
+      for (auto& [consumer_name, count] : res.consumer_list) {
+        rb->StartArray(2);
+        rb->SendBulkString(consumer_name);
+        rb->SendLong(count);
+      }
+    } else {
+      for (unsigned j = 0; j < 3; ++j)
+        rb->SendNull();
+    }
+  } else {
+    const auto& res = std::get<PendingExtendedResultList>(result);
+    if (!res.size()) {
+      return rb->SendEmptyArray();
+    }
+
+    rb->StartArray(res.size());
+    for (auto& item : res) {
+      rb->StartArray(4);
+      rb->SendBulkString(StreamIdRepr(item.start));
+      rb->SendBulkString(item.consumer_name);
+      rb->SendLong(item.elapsed);
+      rb->SendLong(item.delivery_count);
+    }
+  }
+}
+
+void StreamFamily::XRange(CmdArgList args, const CommandContext& cmd_cntx) {
+  string_view key = args[0];
+  string_view start = args[1];
+  string_view end = args[2];
+
+  XRangeGeneric(key, start, end, args.subspan(3), false, cmd_cntx.tx, cmd_cntx.rb);
+}
+
+void StreamFamily::XRevRange(CmdArgList args, const CommandContext& cmd_cntx) {
+  string_view key = args[0];
+  string_view start = args[1];
+  string_view end = args[2];
+
+  XRangeGeneric(key, end, start, args.subspan(3), true, cmd_cntx.tx, cmd_cntx.rb);
+}
+
+variant<bool, facade::ErrorReply> HasEntries2(const OpArgs& op_args, string_view skey,
+                                              ReadOpts* opts) {
+  auto& db_slice = op_args.GetDbSlice();
+  auto res_it = db_slice.FindReadOnly(op_args.db_cntx, skey, OBJ_STREAM);
+  if (!res_it) {
+    if (res_it.status() == OpStatus::WRONG_TYPE)
+      return facade::ErrorReply{res_it.status()};
+    else if (res_it.status() == OpStatus::KEY_NOTFOUND && opts->read_group)
+      return facade::ErrorReply{
+          NoGroupOrKey(skey, opts->group_name, " in XREADGROUP with GROUP option")};
+    return false;
+  }
+
+  const CompactObj& cobj = (*res_it)->second;
+  stream* s = GetReadOnlyStream(cobj);
+
+  // Fetch last id
+  streamID last_id = s->last_id;
+  if (s->length)
+    streamLastValidID(s, &last_id);
+
+  // Check requested
+  auto& requested_sitem = opts->stream_ids.at(skey);
+
+  // Look up group consumer if needed
+  streamCG* group = nullptr;
+  streamConsumer* consumer = nullptr;
+  if (opts->read_group) {
+    group = streamLookupCG(s, WrapSds(opts->group_name));
+    if (!group)
+      return facade::ErrorReply{
+          NoGroupOrKey(skey, opts->group_name, " in XREADGROUP with GROUP option")};
+
+    consumer = FindOrAddConsumer(opts->consumer_name, group, op_args.db_cntx.time_now_ms);
+
+    requested_sitem.group = group;
+    requested_sitem.consumer = consumer;
+
+    // If '>' is not provided, consumer PEL is used. So don't need to block.
+    if (requested_sitem.id.val.ms != UINT64_MAX || requested_sitem.id.val.seq != UINT64_MAX) {
+      opts->serve_history = true;
+      return true;
+    }
+
+    // we know the requested last_id only when we already have it
+    if (streamCompareID(&last_id, &requested_sitem.group->last_id) > 0) {
+      requested_sitem.id.val = requested_sitem.group->last_id;
+      streamIncrID(&requested_sitem.id.val);
+    }
+  } else {
+    // Resolve $ to the last ID in the stream.
+    if (requested_sitem.id.resolve_last_id) {
+      requested_sitem.id.val = last_id;
+      streamIncrID(&requested_sitem.id.val);  // include id's strictly greater
+      requested_sitem.id.resolve_last_id = false;
+      return false;
+    }
+  }
+
+  return streamCompareID(&last_id, &requested_sitem.id.val) >= 0;
+}
+
+void StreamFamily::XRead(CmdArgList args, const CommandContext& cmd_cntx) {
+  return XReadGeneric2(args, false, cmd_cntx.tx, cmd_cntx.rb, cmd_cntx.conn_cntx);
+}
+
+void StreamFamily::XReadGroup(CmdArgList args, const CommandContext& cmd_cntx) {
+  return XReadGeneric2(args, true, cmd_cntx.tx, cmd_cntx.rb, cmd_cntx.conn_cntx);
+}
+
+void StreamFamily::XSetId(CmdArgList args, const CommandContext& cmd_cntx) {
   string_view key = ArgS(args, 0);
   string_view idstr = ArgS(args, 1);
 
   ParsedStreamId parsed_id;
   if (!ParseID(idstr, true, 0, &parsed_id)) {
-    return (*cntx)->SendError(kInvalidStreamId, kSyntaxErrType);
+    return cmd_cntx.rb->SendError(kInvalidStreamId, kSyntaxErrType);
   }
 
+  facade::ErrorReply reply(OpStatus::OK);
   auto cb = [&](Transaction* t, EngineShard* shard) {
-    return OpSetId2(t->GetOpArgs(shard), key, parsed_id.val);
+    reply = OpXSetId(t->GetOpArgs(shard), key, parsed_id.val);
+    return OpStatus::OK;
   };
 
-  OpStatus result = cntx->transaction->ScheduleSingleHop(std::move(cb));
-  switch (result) {
-    case OpStatus::STREAM_ID_SMALL:
-      return (*cntx)->SendError(
-          "The ID specified in XSETID is smaller than the target stream top item");
-    case OpStatus::ENTRIES_ADDED_SMALL:
-      return (*cntx)->SendError(
-          "The entries_added specified in XSETID is smaller than "
-          "the target stream length");
-    default:
-      return (*cntx)->SendError(result);
+  cmd_cntx.tx->ScheduleSingleHop(std::move(cb));
+  if (reply.status == OpStatus::STREAM_ID_SMALL) {
+    return cmd_cntx.rb->SendError(LeqTopIdError("XSETID"));
   }
+  return cmd_cntx.rb->SendError(reply);
 }
 
-void StreamFamily::XTrim(CmdArgList args, ConnectionContext* cntx) {
-  auto parse_resp = ParseAddOrTrimArgsOrReply(args, cntx, true);
-  if (!parse_resp) {
+void StreamFamily::XTrim(CmdArgList args, const CommandContext& cmd_cntx) {
+  CmdArgParser parser{args};
+  auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx.rb);
+
+  std::string_view key = parser.Next();
+
+  auto parsed_trim_opts = ParseTrimOpts(&parser);
+  if (!parsed_trim_opts || !parser.Finalize()) {
+    rb->SendError(!parsed_trim_opts ? parsed_trim_opts.error() : parser.Error()->MakeReply());
     return;
   }
 
-  auto trim_opts = parse_resp->first;
+  auto& trim_opts = parsed_trim_opts.value();
+
+  // We can auto-journal if we are not trimming approximately or by maxlen
+  const bool enable_auto_journaling = !JournalAsMinId(trim_opts);
+  if (enable_auto_journaling) {
+    cmd_cntx.tx->ReviveAutoJournal();
+  }
 
   auto cb = [&](Transaction* t, EngineShard* shard) {
-    return OpTrim(t->GetOpArgs(shard), trim_opts);
+    return OpTrim(t->GetOpArgs(shard), key, trim_opts, !enable_auto_journaling);
   };
 
-  OpResult<int64_t> trim_result = cntx->transaction->ScheduleSingleHopT(std::move(cb));
+  OpResult<int64_t> trim_result = cmd_cntx.tx->ScheduleSingleHopT(cb);
   if (trim_result) {
-    return (*cntx)->SendLong(*trim_result);
+    rb->SendLong(*trim_result);
+  } else {
+    rb->SendError(trim_result.status());
   }
-  return (*cntx)->SendError(trim_result.status());
 }
 
-void StreamFamily::XRangeGeneric(CmdArgList args, bool is_rev, ConnectionContext* cntx) {
+void StreamFamily::XAck(CmdArgList args, const CommandContext& cmd_cntx) {
   string_view key = ArgS(args, 0);
-  string_view start = ArgS(args, 1);
-  string_view end = ArgS(args, 2);
-  RangeOpts range_opts;
-  RangeId rs, re;
-  if (!ParseRangeId(start, &rs) || !ParseRangeId(end, &re)) {
-    return (*cntx)->SendError(kInvalidStreamId, kSyntaxErrType);
-  }
+  string_view group = ArgS(args, 1);
+  args.remove_prefix(2);
+  absl::InlinedVector<streamID, 8> ids(args.size());
 
-  if (rs.exclude && streamIncrID(&rs.parsed_id.val) != C_OK) {
-    return (*cntx)->SendError("invalid start ID for the interval", kSyntaxErrType);
-  }
-
-  if (re.exclude && streamDecrID(&re.parsed_id.val) != C_OK) {
-    return (*cntx)->SendError("invalid end ID for the interval", kSyntaxErrType);
-  }
-
-  if (args.size() > 3) {
-    if (args.size() != 5) {
-      return (*cntx)->SendError(WrongNumArgsError("XRANGE"), kSyntaxErrType);
+  for (size_t i = 0; i < args.size(); ++i) {
+    ParsedStreamId parsed_id;
+    string_view str_id = ArgS(args, i);
+    if (!ParseID(str_id, true, 0, &parsed_id)) {
+      return cmd_cntx.rb->SendError(kInvalidStreamId, kSyntaxErrType);
     }
-    ToUpper(&args[3]);
-    string_view opt = ArgS(args, 3);
-    string_view val = ArgS(args, 4);
-
-    if (opt != "COUNT" || !absl::SimpleAtoi(val, &range_opts.count)) {
-      return (*cntx)->SendError(kSyntaxErr);
-    }
+    ids[i] = parsed_id.val;
   }
-
-  range_opts.start = rs.parsed_id;
-  range_opts.end = re.parsed_id;
-  range_opts.is_rev = is_rev;
 
   auto cb = [&](Transaction* t, EngineShard* shard) {
-    return OpRange(t->GetOpArgs(shard), key, range_opts);
+    return OpAck(t->GetOpArgs(shard), key, group, absl::Span{ids.data(), ids.size()});
   };
 
-  OpResult<RecordVec> result = cntx->transaction->ScheduleSingleHopT(std::move(cb));
+  OpResult<uint32_t> result = cmd_cntx.tx->ScheduleSingleHopT(cb);
+  if (result || result.status() == OpStatus::KEY_NOTFOUND) {
+    return cmd_cntx.rb->SendLong(*result);
+  }
 
-  if (result) {
-    SinkReplyBuilder::ReplyAggregator agg(cntx->reply_builder());
+  cmd_cntx.rb->SendError(result.status());
+}
 
-    (*cntx)->StartArray(result->size());
-    for (const auto& item : *result) {
-      (*cntx)->StartArray(2);
-      (*cntx)->SendBulkString(StreamIdRepr(item.id));
-      (*cntx)->StartArray(item.kv_arr.size() * 2);
-      for (const auto& k_v : item.kv_arr) {
-        (*cntx)->SendBulkString(k_v.first);
-        (*cntx)->SendBulkString(k_v.second);
+void StreamFamily::XAutoClaim(CmdArgList args, const CommandContext& cmd_cntx) {
+  ClaimOpts opts;
+  string_view key = ArgS(args, 0);
+  opts.group = ArgS(args, 1);
+  opts.consumer = ArgS(args, 2);
+  auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx.rb);
+
+  if (!absl::SimpleAtoi(ArgS(args, 3), &opts.min_idle_time)) {
+    return rb->SendError(kSyntaxErr);
+  }
+
+  opts.min_idle_time = std::max((int64)0, opts.min_idle_time);
+
+  string_view start = ArgS(args, 4);
+  RangeId rs;
+
+  if (!ParseRangeId(start, RangeBoundary::kStart, &rs)) {
+    return rb->SendError(kSyntaxErr);
+  }
+
+  if (rs.exclude && streamDecrID(&rs.parsed_id.val) != C_OK) {
+    return rb->SendError("invalid start ID for the interval", kSyntaxErrType);
+  }
+  opts.start = rs.parsed_id.val;
+
+  for (size_t i = 5; i < args.size(); ++i) {
+    string arg = absl::AsciiStrToUpper(ArgS(args, i));
+
+    bool remaining_args = args.size() - i - 1 > 0;
+
+    if (remaining_args) {
+      if (arg == "COUNT") {
+        arg = ArgS(args, ++i);
+        if (!absl::SimpleAtoi(arg, &opts.count)) {
+          return rb->SendError(kInvalidIntErr);
+        }
+        if (opts.count <= 0 || opts.count >= (1L << 18)) {
+          return rb->SendError("COUNT must be > 0 and less than 2^18");
+        }
+        continue;
       }
     }
+    if (arg == "JUSTID") {
+      opts.flags |= kClaimJustID;
+    } else {
+      return cmd_cntx.rb->SendError("Unknown argument given for XAUTOCLAIM command", kSyntaxErr);
+    }
+  }
+
+  auto cb = [&](Transaction* t, EngineShard* shard) {
+    return OpAutoClaim(t->GetOpArgs(shard), key, opts);
+  };
+  OpResult<ClaimInfo> result = cmd_cntx.tx->ScheduleSingleHopT(std::move(cb));
+
+  if (result.status() == OpStatus::KEY_NOTFOUND) {
+    rb->SendError(NoGroupOrKey(key, opts.group));
     return;
   }
 
-  if (result.status() == OpStatus::KEY_NOTFOUND) {
-    return (*cntx)->SendEmptyArray();
+  if (!result) {
+    rb->SendError(result.status());
+    return;
   }
-  return (*cntx)->SendError(result.status());
+
+  ClaimInfo cresult = result.value();
+
+  rb->StartArray(3);
+  rb->SendBulkString(StreamIdRepr(cresult.end_id));
+  StreamReplies{rb}.SendClaimInfo(cresult);
+  StreamReplies{rb}.SendIDs(cresult.deleted_ids);
 }
 
 #define HFUNC(x) SetHandler(&StreamFamily::x)
 
+namespace acl {
+constexpr uint32_t kXAdd = WRITE | STREAM | FAST;
+constexpr uint32_t kXClaim = WRITE | FAST;
+constexpr uint32_t kXDel = WRITE | STREAM | FAST;
+constexpr uint32_t kXGroup = SLOW;
+constexpr uint32_t kXInfo = SLOW;
+constexpr uint32_t kXLen = READ | STREAM | FAST;
+constexpr uint32_t kXPending = READ | STREAM;
+constexpr uint32_t kXRange = READ | STREAM | SLOW;
+constexpr uint32_t kXRevRange = READ | STREAM | SLOW;
+constexpr uint32_t kXRead = READ | STREAM | SLOW | BLOCKING;
+constexpr uint32_t kXReadGroup = WRITE | STREAM | SLOW | BLOCKING;
+constexpr uint32_t kXSetId = WRITE | STREAM | SLOW;
+constexpr uint32_t kXTrim = WRITE | STREAM | SLOW;
+constexpr uint32_t kXGroupHelp = READ | STREAM | SLOW;
+constexpr uint32_t kXAck = WRITE | STREAM | FAST;
+constexpr uint32_t kXAutoClaim = WRITE | STREAM | FAST;
+}  // namespace acl
+
 void StreamFamily::Register(CommandRegistry* registry) {
   using CI = CommandId;
-
-  *registry << CI{"XADD", CO::WRITE | CO::FAST, -5, 1, 1, 1}.HFUNC(XAdd)
-            << CI{"XDEL", CO::WRITE | CO::FAST, -3, 1, 1, 1}.HFUNC(XDel)
-            << CI{"XGROUP", CO::WRITE | CO::DENYOOM, -3, 2, 2, 1}.HFUNC(XGroup)
-            << CI{"XINFO", CO::READONLY | CO::NOSCRIPT, -2, 0, 0, 0}.HFUNC(XInfo)
-            << CI{"XLEN", CO::READONLY | CO::FAST, 2, 1, 1, 1}.HFUNC(XLen)
-            << CI{"XRANGE", CO::READONLY, -4, 1, 1, 1}.HFUNC(XRange)
-            << CI{"XREVRANGE", CO::READONLY, -4, 1, 1, 1}.HFUNC(XRevRange)
-            << CI{"XREAD", CO::READONLY | CO::REVERSE_MAPPING | CO::VARIADIC_KEYS, -3, 3, 3, 1}
-                   .HFUNC(XRead)
-            << CI{"XREADGROUP", CO::READONLY | CO::REVERSE_MAPPING | CO::VARIADIC_KEYS, -6, 6, 6, 1}
-                   .HFUNC(XReadGroup)
-            << CI{"XSETID", CO::WRITE | CO::DENYOOM, 3, 1, 1, 1}.HFUNC(XSetId)
-            << CI{"XTRIM", CO::WRITE | CO::FAST, -4, 1, 1, 1}.HFUNC(XTrim)
-            << CI{"_XGROUP_HELP", CO::NOSCRIPT | CO::HIDDEN, 2, 0, 0, 0}.SetHandler(XGroupHelp);
+  registry->StartFamily();
+  constexpr auto kReadFlags = CO::READONLY | CO::BLOCKING | CO::VARIADIC_KEYS;
+  *registry << CI{"XADD",    CO::WRITE | CO::DENYOOM | CO::FAST | CO::NO_AUTOJOURNAL, -5, 1, 1,
+                  acl::kXAdd}
+                   .HFUNC(XAdd)
+            << CI{"XCLAIM", CO::WRITE | CO::FAST, -6, 1, 1, acl::kXClaim}.HFUNC(XClaim)
+            << CI{"XDEL", CO::WRITE | CO::FAST, -3, 1, 1, acl::kXDel}.HFUNC(XDel)
+            << CI{"XGROUP", CO::WRITE | CO::DENYOOM, -3, 2, 2, acl::kXGroup}.HFUNC(XGroup)
+            << CI{"XINFO", CO::READONLY | CO::NOSCRIPT, -2, 0, 0, acl::kXInfo}.HFUNC(XInfo)
+            << CI{"XLEN", CO::READONLY | CO::FAST, 2, 1, 1, acl::kXLen}.HFUNC(XLen)
+            << CI{"XPENDING", CO::READONLY, -2, 1, 1, acl::kXPending}.HFUNC(XPending)
+            << CI{"XRANGE", CO::READONLY, -4, 1, 1, acl::kXRange}.HFUNC(XRange)
+            << CI{"XREVRANGE", CO::READONLY, -4, 1, 1, acl::kXRevRange}.HFUNC(XRevRange)
+            << CI{"XREAD", kReadFlags, -3, 3, 3, acl::kXRead}.HFUNC(XRead)
+            << CI{"XREADGROUP", kReadFlags, -6, 6, 6, acl::kXReadGroup}.HFUNC(XReadGroup)
+            << CI{"XSETID", CO::WRITE, 3, 1, 1, acl::kXSetId}.HFUNC(XSetId)
+            << CI{"XTRIM", CO::WRITE | CO::FAST | CO::NO_AUTOJOURNAL, -4, 1, 1, acl::kXTrim}.HFUNC(
+                   XTrim)
+            << CI{"_XGROUP_HELP", CO::NOSCRIPT | CO::HIDDEN, 2, 0, 0, acl::kXGroupHelp}.SetHandler(
+                   XGroupHelp)
+            << CI{"XACK", CO::WRITE | CO::FAST, -4, 1, 1, acl::kXAck}.HFUNC(XAck)
+            << CI{"XAUTOCLAIM", CO::WRITE | CO::FAST, -6, 1, 1, acl::kXAutoClaim}.HFUNC(XAutoClaim);
 }
 
 }  // namespace dfly

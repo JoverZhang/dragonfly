@@ -26,16 +26,17 @@
   using dfly::search::Parser;
   using namespace std;
 
-  Parser::symbol_type make_INT64 (string_view, const Parser::location_type& loc);
   Parser::symbol_type make_StringLit(string_view src, const Parser::location_type& loc);
+  Parser::symbol_type make_TagVal(string_view src, const Parser::location_type& loc);
 %}
 
 blank [ \t\r]
 dq    \"
+sq    \'
 esc_chars ['"\?\\abfnrtv]
 esc_seq \\{esc_chars}
-str_char ([^"]|{esc_seq})
 term_char [_]|\w
+tag_val_char {term_char}|\\[,.<>{}\[\]\\\"\':;!@#$%^&*()\-+=~\/ ]
 
 
 %{
@@ -62,33 +63,48 @@ term_char [_]|\w
 "}"            return Parser::make_RCURLBR (loc());
 "|"            return Parser::make_OR_OP (loc());
 "KNN"          return Parser::make_KNN (loc());
+"AS"           return Parser::make_AS (loc());
+"EF_RUNTIME"   return Parser::make_EF_RUNTIME (loc());
 
--?[0-9]+       return make_INT64(matched_view(), loc());
+[0-9]{1,9}                     return Parser::make_UINT32(str(), loc());
+[+-]?(([0-9]*[.])?[0-9]+|inf)  return Parser::make_DOUBLE(str(), loc());
 
-{dq}{str_char}*{dq}  return make_StringLit(matched_view(1, 1), loc());
+{dq}([^"]|{esc_seq})*{dq}  return make_StringLit(matched_view(1, 1), loc());
+{sq}([^']|{esc_seq})*{sq}  return make_StringLit(matched_view(1, 1), loc());
 
-"$"{term_char}+ return Parser::make_PARAM(str(), loc());
+"$"{term_char}+ return ParseParam(str(), loc());
 "@"{term_char}+ return Parser::make_FIELD(str(), loc());
+{term_char}+"*" return Parser::make_PREFIX(str(), loc());
 
-{term_char}+   return Parser::make_TERM(str(), loc());
+{term_char}+ return Parser::make_TERM(str(), loc());
+{tag_val_char}+   return make_TagVal(str(), loc());
 
 <<EOF>>    return Parser::make_YYEOF(loc());
 %%
 
-Parser::symbol_type
-make_INT64 (string_view str, const Parser::location_type& loc)
-{
-  int64_t val = 0;
-  if (!absl::SimpleAtoi(str, &val))
-    throw Parser::syntax_error (loc, "not an integer or out of range: " + string(str));
-
-  return Parser::make_INT64(val, loc);
-}
-
 Parser::symbol_type make_StringLit(string_view src, const Parser::location_type& loc) {
   string res;
-  if (!absl::CUnescape(src, &res)) {
+  if (!absl::CUnescape(src, &res))
     throw Parser::syntax_error (loc, "bad escaped string: " + string(src));
-  }
+
   return Parser::make_TERM(res, loc);
+}
+
+Parser::symbol_type make_TagVal(string_view src, const Parser::location_type& loc) {
+  string res;
+  res.reserve(src.size());
+
+  bool escaped = false;
+  for (size_t i = 0; i < src.size(); ++i) {
+    if (escaped) {
+      escaped = false;
+    } else if (src[i] == '\\') {
+      escaped = true;
+      continue;
+    }
+    res.push_back(src[i]);
+
+  }
+
+  return Parser::make_TAG_VAL(res, loc);
 }

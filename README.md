@@ -7,15 +7,19 @@
 
 [![ci-tests](https://github.com/dragonflydb/dragonfly/actions/workflows/ci.yml/badge.svg)](https://github.com/dragonflydb/dragonfly/actions/workflows/ci.yml) [![Twitter URL](https://img.shields.io/twitter/follow/dragonflydbio?style=social)](https://twitter.com/dragonflydbio)
 
+> Before moving on, please consider giving us a GitHub star ⭐️. Thank you!
+
 Other languages:  [简体中文](README.zh-CN.md) [日本語](README.ja-JP.md) [한국어](README.ko-KR.md)
 
-[Website](https://www.dragonflydb.io/) • [Docs](https://dragonflydb.io/docs) • [Quick Start](https://www.dragonflydb.io/docs/getting-started) • [Community Discord](https://discord.gg/HsPjXGVH85) • [GitHub Discussions](https://github.com/dragonflydb/dragonfly/discussions) | [GitHub Issues](https://github.com/dragonflydb/dragonfly/issues) | [Contributing](https://github.com/dragonflydb/dragonfly/blob/main/CONTRIBUTING.md)
+[Website](https://www.dragonflydb.io/) • [Docs](https://dragonflydb.io/docs) • [Quick Start](https://www.dragonflydb.io/docs/getting-started) • [Community Discord](https://discord.gg/HsPjXGVH85) • [Dragonfly Forum](https://dragonfly.discourse.group/) • [Join the Dragonfly Community](https://www.dragonflydb.io/community)
 
-## The world's fastest in-memory data store
+[GitHub Discussions](https://github.com/dragonflydb/dragonfly/discussions) • [GitHub Issues](https://github.com/dragonflydb/dragonfly/issues) • [Contributing](https://github.com/dragonflydb/dragonfly/blob/main/CONTRIBUTING.md) • [Dragonfly Cloud](https://www.dragonflydb.io/cloud)
+
+## The world's most efficient in-memory data store
 
 Dragonfly is an in-memory data store built for modern application workloads.
 
-Fully compatible with Redis and Memcached APIs, Dragonfly requires no code changes to adopt. Compared to legacy in-memory datastores, Dragonfly delivers 25X more throughput, higher cache hit rates with lower tail latency, and effortless vertical scalability.
+Fully compatible with Redis and Memcached APIs, Dragonfly requires no code changes to adopt. Compared to legacy in-memory datastores, Dragonfly delivers 25X more throughput, higher cache hit rates with lower tail latency, and can run on up to 80% less resources for the same sized workload.
 
 ## Contents
 
@@ -25,12 +29,54 @@ Fully compatible with Redis and Memcached APIs, Dragonfly requires no code chang
 - [Roadmap and status](#roadmap-status)
 - [Design decisions](#design-decisions)
 - [Background](#background)
+- [Build from source](./docs/build-from-source.md)
 
 ## <a name="benchmarks"><a/>Benchmarks
 
+We first compare Dragonfly with Redis on `m5.large` instance which is commonly used to run Redis
+due to its single-threaded architecture. The benchmark program runs from another
+load-test instance (c5n) in the same AZ using `memtier_benchmark  -c 20 --test-time 100 -t 4 -d 256 --distinct-client-seed`
+
+Dragonfly shows a comparable performance:
+
+1. SETs (`--ratio 1:0`):
+
+|  Redis                                   |      DF                                |
+| -----------------------------------------|----------------------------------------|
+| QPS: 159K, P99.9: 1.16ms, P99: 0.82ms    | QPS:173K, P99.9: 1.26ms, P99: 0.9ms    |
+|                                          |                                        |
+
+2. GETs (`--ratio 0:1`):
+
+|  Redis                                  |      DF                                |
+| ----------------------------------------|----------------------------------------|
+| QPS: 194K, P99.9: 0.8ms, P99: 0.65ms    | QPS: 191K, P99.9: 0.95ms, P99: 0.8ms   |
+
+The benchmark above shows that the algorithmic layer inside DF that allows it to scale vertically
+does not take a large toll when running single-threaded.
+
+However, if we take a bit stronger instance (m5.xlarge), the gap between DF and Redis starts growing.
+(`memtier_benchmark  -c 20 --test-time 100 -t 6 -d 256 --distinct-client-seed`):
+1. SETs (`--ratio 1:0`):
+
+|  Redis                                  |      DF                                |
+| ----------------------------------------|----------------------------------------|
+| QPS: 190K, P99.9: 2.45ms, P99: 0.97ms   |  QPS: 279K , P99.9: 1.95ms, P99: 1.48ms|
+
+2. GETs (`--ratio 0:1`):
+
+|  Redis                                  |      DF                                |
+| ----------------------------------------|----------------------------------------|
+| QPS: 220K, P99.9: 0.98ms , P99: 0.8ms   |  QPS: 305K, P99.9: 1.03ms, P99: 0.87ms |
+
+
+Dragonfly throughput capacity continues to grow with instance size,
+while single-threaded Redis is bottlenecked on CPU and reaches local maxima in terms of performance.
+
 <img src="http://static.dragonflydb.io/repo-assets/aws-throughput.svg" width="80%" border="0"/>
 
-In benchmarks, Dragonfly showed a 25X increase in throughput compared to Redis, crossing 3.8M QPS on c6gn.16xlarge.
+If we compare Dragonfly and Redis on the most network-capable instance c6gn.16xlarge,
+Dragonfly showed a 25X increase in throughput compared to Redis single process, crossing 3.8M QPS.
 
 Dragonfly's 99th percentile latency metrics at its peak throughput:
 
@@ -94,7 +140,7 @@ Dragonfly supports common Redis arguments where applicable. For example, you can
 
 Dragonfly currently supports the following Redis-specific arguments:
  * `port`: Redis connection port (`default: 6379`).
- * `bind`: Use `localhost` to only allow localhost connections or a public IP address to allow connections **to that IP** address (i.e. from outside too).
+ * `bind`: Use `localhost` to only allow localhost connections or a public IP address to allow connections **to that IP** address (i.e. from outside too). Use `0.0.0.0` to allow all IPv4.
  * `requirepass`: The password for AUTH authentication (`default: ""`).
  * `maxmemory`: Limit on maximum memory (in human-readable bytes) used by the database (`default: 0`). A `maxmemory` value of `0` means the program will automatically determine its maximum memory usage.
  * `dir`: Dragonfly Docker uses the `/data` folder for snapshotting by default, the CLI uses `""`. You can use the `-v` Docker option to map it to your host folder.
@@ -106,27 +152,40 @@ There are also some Dragonfly-specific arguments:
  * `dbnum`: Maximum number of supported databases for `select`.
  * `cache_mode`: See the [novel cache design](#novel-cache-design) section below.
  * `hz`: Key expiry evaluation frequency (`default: 100`). Lower frequency uses less CPU when idle at the expense of a slower eviction rate.
- * `save_schedule`: Glob spec for the UTC to save a snapshot in HH:MM (24h time) format (`default: ""`).
+ * `snapshot_cron`: Cron schedule expression for automatic backup snapshots using standard cron syntax with the granularity of minutes (`default: ""`).
+   Here are some cron schedule expression examples below, and feel free to read more about this argument in our [documentation](https://www.dragonflydb.io/docs/managing-dragonfly/backups#the-snapshot_cron-flag).
+
+   | Cron Schedule Expression | Description                                |
+   |--------------------------|--------------------------------------------|
+   | `* * * * *`              | At every minute                            |
+   | `*/5 * * * *`            | At every 5th minute                        |
+   | `5 */2 * * *`            | At minute 5 past every 2nd hour            |
+   | `0 0 * * *`              | At 00:00 (midnight) every day              |
+   | `0 6 * * 1-5`            | At 06:00 (dawn) from Monday through Friday |
+
  * `primary_port_http_enabled`: Allows accessing HTTP console on main TCP port if `true` (`default: true`).
  * `admin_port`: To enable admin access to the console on the assigned port (`default: disabled`). Supports both HTTP and RESP protocols.
  * `admin_bind`: To bind the admin console TCP connection to a given address (`default: any`). Supports both HTTP and RESP protocols.
  * `admin_nopass`: To enable open admin access to console on the assigned port, without auth token needed (`default: false`). Supports both HTTP and RESP protocols.
  * `cluster_mode`: Cluster mode supported (`default: ""`). Currently supports only `emulated`.
  * `cluster_announce_ip`: The IP that cluster commands announce to the client.
+ * `announce_port`: The port that cluster commands announce to the client, and to replication master.
 
 ### Example start script with popular options:
 
 ```bash
-./dragonfly-x86_64 --logtostderr --requirepass=youshallnotpass --cache_mode=true -dbnum 1 --bind localhost --port 6379  --save_schedule "*:30" --maxmemory=12gb --keys_output_limit=12288 --dbfilename dump.rdb
+./dragonfly-x86_64 --logtostderr --requirepass=youshallnotpass --cache_mode=true -dbnum 1 --bind localhost --port 6379 --maxmemory=12gb --keys_output_limit=12288 --dbfilename dump.rdb
 ```
 
-Arguments can be also provided from a configuration file by runnning `dragonfly --flagfile <filename>`. The file should list one flag per line, with equal signs instead of spaces for key-value flags.
+Arguments can be also provided via:
+ * `--flagfile <filename>`: The file should list one flag per line, with equal signs instead of spaces for key-value flags. No quotes are needed for flag values.
+ * Setting environment variables. Set `DFLY_x`, where `x` is the exact name of the flag, case sensitive.
 
 For more options like logs management or TLS support, run `dragonfly --help`.
 
 ## <a name="roadmap-status"><a/>Roadmap and status
 
-Dragonfly currently supports ~185 Redis commands and all Memcache commands besides `cas`. Almost on par with the Redis 5 API, Dragonfly's next milestone will be to stabilize basic functionality and implement the replication API. If there is a command you need that is not implemented yet, please open an issue.
+Dragonfly currently supports ~185 Redis commands and all Memcached commands besides `cas`. Almost on par with the Redis 5 API, Dragonfly's next milestone will be to stabilize basic functionality and implement the replication API. If there is a command you need that is not implemented yet, please open an issue.
 
 For Dragonfly-native replication, we are designing a distributed log format that will support order-of-magnitude higher speeds.
 
@@ -144,9 +203,9 @@ You can enable caching mode by passing the `--cache_mode=true` flag. Once this m
 
 ### Expiration deadlines with relative accuracy
 
-Expiration ranges are limited to ~4 years.
+Expiration ranges are limited to ~8 years.
 
-Expiration deadlines with millisecond precision (PEXPIRE, PSETEX, etc.) are rounded to the closest second **for deadlines greater than 134217727ms (approximately 37 hours)**, which has less than 0.001% error and should be acceptable for large ranges. If this is not suitable for your use case, get in touch or open an issue explaining your case.
+Expiration deadlines with millisecond precision (PEXPIRE, PSETEX, etc.) are rounded to the closest second **for deadlines greater than 2^28ms**, which has less than 0.001% error and should be acceptable for large ranges. If this is not suitable for your use case, get in touch or open an issue explaining your case.
 
 For more detailed differences between Dragonfly expiration deadlines and Redis implementations, [see here](docs/differences.md).
 
@@ -159,7 +218,7 @@ Go to the URL `:6379/metrics` to view Prometheus-compatible metrics.
 The Prometheus exported metrics are compatible with the Grafana dashboard, [see here](tools/local/monitoring/grafana/provisioning/dashboards/dashboard.json).
 
 
-Important! The HTTP console is meant to be accessed within a safe network. If you expose Dragonfly's TCP port externally, we advise you disable the console with `--http_admin_console=false` or `--nohttp_admin_console`.
+Important! The HTTP console is meant to be accessed within a safe network. If you expose Dragonfly's TCP port externally, we advise you to disable the console with `--http_admin_console=false` or `--nohttp_admin_console`.
 
 
 ## <a name="background"><a/>Background

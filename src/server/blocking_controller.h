@@ -10,15 +10,19 @@
 
 #include "base/string_view_sso.h"
 #include "server/common.h"
+#include "server/tx_base.h"
 
 namespace dfly {
 
 class Transaction;
+class Namespace;
 
 class BlockingController {
  public:
-  explicit BlockingController(EngineShard* owner);
+  explicit BlockingController(EngineShard* owner, Namespace* ns);
   ~BlockingController();
+
+  using Keys = ShardArgs;
 
   bool HasAwakedTransaction() const {
     return !awakened_transactions_.empty();
@@ -28,10 +32,9 @@ class BlockingController {
     return awakened_transactions_;
   }
 
-  void FinalizeWatched(KeyLockArgs lock_args, Transaction* tx);
+  // Removes transaction from watching these keys.
+  void RemovedWatched(Keys keys, Transaction* tx);
 
-  // A mirror reflection but with ArgSlice. Yeah, I know....
-  void FinalizeWatched(ArgSlice args, Transaction* tx);
   // go over potential wakened keys, verify them and activate watch queues.
   void NotifyPending();
 
@@ -39,7 +42,7 @@ class BlockingController {
   // TODO: consider moving all watched functions to
   // EngineShard with separate per db map.
   //! AddWatched adds a transaction to the blocking queue.
-  void AddWatched(ArgSlice watch_keys, Transaction* me);
+  void AddWatched(Keys watch_keys, KeyReadyChecker krc, Transaction* me);
 
   // Called from operations that create keys like lpush, rename etc.
   void AwakeWatched(DbIndex db_index, std::string_view db_key);
@@ -54,11 +57,12 @@ class BlockingController {
 
   using WatchQueueMap = absl::flat_hash_map<std::string, std::unique_ptr<WatchQueue>>;
 
-  void NotifyWatchQueue(std::string_view key, WatchQueueMap* wqm);
+  void NotifyWatchQueue(std::string_view key, WatchQueue* wqm, const DbContext& context);
 
   // void NotifyConvergence(Transaction* tx);
 
   EngineShard* owner_;
+  Namespace* ns_;
 
   absl::flat_hash_map<DbIndex, std::unique_ptr<DbWatchTable>> watched_dbs_;
 

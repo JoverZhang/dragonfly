@@ -6,35 +6,38 @@
 
 namespace dfly::journal {
 
-std::string Entry::ToString() const {
-  std::string rv = absl::StrCat("{op=", opcode, ", dbid=", dbid);
-  std::visit(
-      [&rv](const auto& payload) {
-        if constexpr (std::is_same_v<std::decay_t<decltype(payload)>, std::monostate>) {
-          absl::StrAppend(&rv, ", empty");
-        } else {
-          const auto& [cmd, args] = payload;
-          absl::StrAppend(&rv, ", cmd='");
-          absl::StrAppend(&rv, cmd);
-          absl::StrAppend(&rv, "', args=[");
-          for (size_t i = 0; i < args.size(); i++) {
-            absl::StrAppend(&rv, "'");
-            absl::StrAppend(&rv, facade::ToSV(args[i]));
-            absl::StrAppend(&rv, "'");
-            if (i + 1 != args.size())
-              absl::StrAppend(&rv, ", ");
-          }
-          absl::StrAppend(&rv, "]");
-        }
-      },
-      payload);
+using namespace std;
+
+void AppendPrefix(string_view cmd, string* dest) {
+  absl::StrAppend(dest, ", cmd='");
+  absl::StrAppend(dest, cmd);
+  absl::StrAppend(dest, "', args=[");
+}
+
+void AppendSuffix(string* dest) {
+  if (dest->back() == ',')
+    dest->pop_back();
+  absl::StrAppend(dest, "]");
+}
+
+string Entry::ToString() const {
+  string rv = absl::StrCat("{op=", opcode, ", dbid=", dbid);
+
+  if (HasPayload()) {
+    AppendPrefix(payload.cmd, &rv);
+    for (string_view arg : base::it::Wrap(facade::kToSV, payload.args))
+      absl::StrAppend(&rv, "'", facade::ToSV(arg), "',");
+    AppendSuffix(&rv);
+  } else {
+    absl::StrAppend(&rv, ", empty");
+  }
 
   rv += "}";
   return rv;
 }
 
-std::string ParsedEntry::ToString() const {
-  std::string rv = absl::StrCat("{op=", opcode, ", dbid=", dbid, ", cmd='");
+string ParsedEntry::ToString() const {
+  string rv = absl::StrCat("{op=", opcode, ", dbid=", dbid, ", cmd='");
   for (auto& arg : cmd.cmd_args) {
     absl::StrAppend(&rv, facade::ToSV(arg));
     absl::StrAppend(&rv, " ");

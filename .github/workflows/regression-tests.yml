@@ -2,94 +2,82 @@ name: Regression Tests
 
 on:
   schedule:
-    - cron: '0 0/3 * * *'
+    - cron: "0 0/3 * * *"
   workflow_dispatch:
 
-
-
-
 jobs:
-  build-n-test:
+  build:
     strategy:
       matrix:
         # Test of these containers
         container: ["ubuntu-dev:20"]
+        proactor: [Uring]
         build-type: [Debug, Release]
         runner: [ubuntu-latest, [self-hosted, linux, ARM64]]
+
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
 
     container:
       image: ghcr.io/romange/${{ matrix.container }}
+      options: --security-opt seccomp=unconfined --sysctl "net.ipv6.conf.all.disable_ipv6=0"
+      volumes:
+        - /var/crash:/var/crash
+
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: true
 
-      - name: Print cpu info
-        run:  cat /proc/cpuinfo
+      - name: Print environment info
+        run: |
+          cat /proc/cpuinfo
+          ulimit -a
+          env
 
       - name: Configure & Build
         run: |
-          apt update && apt install -y pip jq
+          # -no-pie to disable address randomization so we could symbolize stacktraces
           cmake -B ${GITHUB_WORKSPACE}/build -DCMAKE_BUILD_TYPE=${{matrix.build-type}} -GNinja \
-                -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+                -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DPRINT_STACKTRACES_ON_SIGNAL=ON \
+                -DCMAKE_CXX_FLAGS=-no-pie -DHELIO_STACK_CHECK:STRING=4096
 
           cd ${GITHUB_WORKSPACE}/build  && ninja dragonfly
           pwd
           ls -l ..
 
-      - name: Run PyTests
-        timeout-minutes: 20
-        run: |
-          ls -l ${GITHUB_WORKSPACE}/
-          cd ${GITHUB_WORKSPACE}/tests
-          echo "Current commit is ${{github.sha}}"
-          pip install -r dragonfly/requirements.txt
-          export DRAGONFLY_PATH="${GITHUB_WORKSPACE}/build/dragonfly" # used by PyTests
-          export UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 # to crash on errors
+      - name: Run regression tests action
+        uses: ./.github/actions/regression-tests
+        with:
+          dfly-executable: dragonfly
+          gspace-secret: ${{ secrets.GSPACES_BOT_DF_BUILD }}
+          build-folder-name: build
+          filter: ${{ matrix.build-type == 'Release' && 'not dbg_only' || 'not opt_only' }}
+          aws-access-key-id: ${{ secrets.AWS_S3_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_S3_ACCESS_SECRET }}
+          s3-bucket: ${{ secrets.S3_REGTEST_BUCKET }}
+          # Chain ternary oprator of the form (which can be nested)
+          # (expression == condition && <true expression> || <false expression>)
+          epoll: ${{ matrix.proactor == 'Epoll' && 'epoll' || 'iouring' }}
 
-          pytest --json-report --json-report-file=report.json -svr dragonfly --ignore=dragonfly/replication_test.py
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: /tmp/failed/*
 
-
-
-      - name: Run PyTests replication test
-        if: ${{ matrix.runner  == 'ubuntu-latest' }}
-        timeout-minutes: 20
-        run: |
-          cd ${GITHUB_WORKSPACE}/tests
-          export DRAGONFLY_PATH="${GITHUB_WORKSPACE}/build/dragonfly" # used by PyTests
-
-          pytest --json-report --json-report-file=rep1_report.json -sv dragonfly/replication_test.py --df alsologtostderr --df enable_multi_shard_sync=true
-          pytest --json-report --json-report-file=rep2_report.json -sv dragonfly/replication_test.py --df alsologtostderr --df enable_multi_shard_sync=false
-
-
-
-      - name: Send notification on failure
+      - name: Copy binary on a self hosted runner
         if: failure()
         run: |
-          get_failed_tests() {
-            local report_file=$1
-            echo $(jq -r '.tests[] | select(.outcome == "failed") | .nodeid' "$report_file")
-          }
-          cd ${GITHUB_WORKSPACE}/tests
-          failed_tests=""
-          # The order in of if is important, and expected to be the oposite order of the pytest run.
-          # As github runner will not run the next step if the pytest failed, we start from the last
-          # report file and if exist we get the failed test from the pytest run, if there are any.
-          if [ -f rep2_report.json ]; then
-            failed_tests=$(get_failed_tests rep2_report.json)
-          elif [ -f rep1_report.json ]; then
-            failed_tests=$(get_failed_tests rep1_report.json)
-          elif [ -f report.json ]; then
-            failed_tests=$(get_failed_tests report.json)
+          # We must use sh syntax.
+          if [ "$RUNNER_ENVIRONMENT" = "self-hosted" ]; then
+            cd ${GITHUB_WORKSPACE}/build
+            timestamp=$(date +%Y-%m-%d_%H:%M:%S)
+            mv ./dragonfly /var/crash/dragonfy_${timestamp}
           fi
 
-          job_link="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          message="Regression tests failed.\\n The commit is: ${{github.sha}}.\\n $failed_tests \\n Job Link: ${job_link}\\n"
-
-          curl -s \
-            -X POST \
-            -H 'Content-Type: application/json' \
-            '${{ secrets.GSPACES_BOT_DF_BUILD }}' \
-            -d '{"text": "'"${message}"'"}'
+  lint-test-chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/lint-test-chart

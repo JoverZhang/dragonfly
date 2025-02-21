@@ -4,13 +4,10 @@
 // See LICENSE for licensing terms.
 //
 
-#include <shared_mutex>
-
-extern "C" {
-#include "redis/util.h"
-}
+#include <absl/container/fixed_array.h>
 
 #include "base/logging.h"
+#include "core/glob_matcher.h"
 #include "server/engine_shard_set.h"
 #include "server/server_state.h"
 
@@ -19,24 +16,40 @@ using namespace std;
 
 namespace {
 
-bool Matches(string_view pattern, string_view channel) {
-  return stringmatchlen(pattern.data(), pattern.size(), channel.data(), channel.size(), 0) == 1;
+// Build functor for sending messages to connection
+auto BuildSender(string_view channel, facade::ArgRange messages) {
+  absl::FixedArray<string_view, 1> views(messages.Size());
+  size_t messages_size = accumulate(messages.begin(), messages.end(), 0,
+                                    [](int sum, string_view str) { return sum + str.size(); });
+  auto buf = shared_ptr<char[]>{new char[channel.size() + messages_size]};
+  {
+    memcpy(buf.get(), channel.data(), channel.size());
+    char* ptr = buf.get() + channel.size();
+
+    size_t i = 0;
+    for (string_view message : messages) {
+      memcpy(ptr, message.data(), message.size());
+      views[i++] = {ptr, message.size()};
+      ptr += message.size();
+    }
+  }
+
+  return [channel, buf = std::move(buf), views = std::move(views)](facade::Connection* conn,
+                                                                   string pattern) {
+    string_view channel_view{buf.get(), channel.size()};
+    for (std::string_view message_view : views)
+      conn->SendPubMessageAsync({std::move(pattern), buf, channel_view, message_view});
+  };
 }
 
 }  // namespace
 
-ChannelStore::Subscriber::Subscriber(ConnectionContext* cntx, uint32_t tid)
-    : conn_cntx(cntx), borrow_token(cntx->conn_state.subscribe_info->borrow_token), thread_id(tid) {
-}
-
-ChannelStore::Subscriber::Subscriber(uint32_t tid)
-    : conn_cntx(nullptr), borrow_token(0), thread_id(tid) {
-}
-
 bool ChannelStore::Subscriber::ByThread(const Subscriber& lhs, const Subscriber& rhs) {
-  if (lhs.thread_id == rhs.thread_id)
-    return (lhs.conn_cntx != nullptr) < (rhs.conn_cntx != nullptr);
-  return lhs.thread_id < rhs.thread_id;
+  return ByThreadId(lhs, rhs.Thread());
+}
+
+bool ChannelStore::Subscriber::ByThreadId(const Subscriber& lhs, const unsigned thread) {
+  return lhs.Thread() < thread;
 }
 
 ChannelStore::UpdatablePointer::UpdatablePointer(const UpdatablePointer& other) {
@@ -44,14 +57,14 @@ ChannelStore::UpdatablePointer::UpdatablePointer(const UpdatablePointer& other) 
 }
 
 ChannelStore::SubscribeMap* ChannelStore::UpdatablePointer::Get() const {
-  return ptr.load(memory_order_relaxed);
+  return ptr.load(memory_order_acquire);  // sync pointed memory
 }
 
 void ChannelStore::UpdatablePointer::Set(ChannelStore::SubscribeMap* sm) {
-  ptr.store(sm, memory_order_relaxed);
+  ptr.store(sm, memory_order_release);  // sync pointed memory
 }
 
-ChannelStore::SubscribeMap* ChannelStore::UpdatablePointer::operator->() {
+ChannelStore::SubscribeMap* ChannelStore::UpdatablePointer::operator->() const {
   return Get();
 }
 
@@ -101,6 +114,47 @@ void ChannelStore::Destroy() {
 
 ChannelStore::ControlBlock ChannelStore::control_block;
 
+unsigned ChannelStore::SendMessages(std::string_view channel, facade::ArgRange messages) const {
+  vector<Subscriber> subscribers = FetchSubscribers(channel);
+  if (subscribers.empty())
+    return 0;
+
+  // Make sure none of the threads publish buffer limits is reached. We don't reserve memory ahead
+  // and don't prevent the buffer from possibly filling, but the approach is good enough for
+  // limiting fast producers. Most importantly, we can use DispatchBrief below as we block here
+  int32_t last_thread = -1;
+  for (auto& sub : subscribers) {
+    int sub_thread = sub.Thread();
+    DCHECK_LE(last_thread, sub_thread);
+    if (last_thread == sub_thread)  // skip same thread
+      continue;
+
+    if (sub.IsExpired())
+      continue;
+
+    // Make sure the connection thread has enough memory budget to accept the message.
+    // This is a heuristic and not entirely hermetic since the connection memory might
+    // get filled again.
+    facade::Connection::EnsureMemoryBudget(sub.Thread());
+    last_thread = sub_thread;
+  }
+
+  auto subscribers_ptr = make_shared<decltype(subscribers)>(std::move(subscribers));
+  auto cb = [subscribers_ptr, send = BuildSender(channel, messages)](unsigned idx, auto*) {
+    auto it = lower_bound(subscribers_ptr->begin(), subscribers_ptr->end(), idx,
+                          ChannelStore::Subscriber::ByThreadId);
+    while (it != subscribers_ptr->end() && it->Thread() == idx) {
+      // if ptr->cntx() is null, a connection might have closed or be in the process of closing
+      if (auto* ptr = it->Get(); ptr && ptr->cntx() != nullptr)
+        send(ptr, it->pattern);
+      it++;
+    }
+  };
+  shard_set->pool()->DispatchBrief(std::move(cb));
+
+  return subscribers_ptr->size();
+}
+
 vector<ChannelStore::Subscriber> ChannelStore::FetchSubscribers(string_view channel) const {
   vector<Subscriber> res;
 
@@ -108,7 +162,8 @@ vector<ChannelStore::Subscriber> ChannelStore::FetchSubscribers(string_view chan
     Fill(*it->second, string{}, &res);
 
   for (const auto& [pat, subs] : *patterns_) {
-    if (Matches(pat, channel))
+    GlobMatcher matcher{pat, true};
+    if (matcher.Matches(channel))
       Fill(*subs, pat, &res);
   }
 
@@ -119,20 +174,19 @@ vector<ChannelStore::Subscriber> ChannelStore::FetchSubscribers(string_view chan
 void ChannelStore::Fill(const SubscribeMap& src, const string& pattern, vector<Subscriber>* out) {
   out->reserve(out->size() + src.size());
   for (const auto [cntx, thread_id] : src) {
+    // `cntx` is expected to be valid as it unregisters itself from the channel_store before
+    // closing.
     CHECK(cntx->conn_state.subscribe_info);
-
-    Subscriber s(cntx, thread_id);
-    s.pattern = pattern;
-    s.borrow_token.Inc();
-
-    out->push_back(std::move(s));
+    Subscriber sub{cntx->conn()->Borrow(), pattern};
+    out->push_back(std::move(sub));
   }
 }
 
 std::vector<string> ChannelStore::ListChannels(const string_view pattern) const {
   vector<string> res;
+  GlobMatcher matcher{pattern, true};
   for (const auto& [channel, _] : *channels_) {
-    if (pattern.empty() || Matches(pattern, channel))
+    if (pattern.empty() || matcher.Matches(channel))
       res.push_back(channel);
   }
   return res;
@@ -226,7 +280,7 @@ void ChannelStoreUpdater::Apply() {
   // structs. This means that any point on the other thread is safe to update the channel store.
   // Regardless of whether we need to replace, we dispatch to make sure all
   // queued SubscribeMaps in the freelist are no longer in use.
-  shard_set->pool()->Await([](unsigned idx, util::ProactorBase*) {
+  shard_set->pool()->AwaitBrief([](unsigned idx, util::ProactorBase*) {
     ServerState::tlocal()->UpdateChannelStore(
         ChannelStore::control_block.most_recent.load(memory_order_relaxed));
   });

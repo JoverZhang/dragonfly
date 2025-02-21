@@ -16,6 +16,9 @@ volumeMounts:
 {{- end }}
 
 {{- define "dragonfly.pod" -}}
+{{- if ne .Values.priorityClassName "" }}
+priorityClassName: {{ .Values.priorityClassName }}
+{{- end }}
 {{- with .Values.tolerations }}
 tolerations:
   {{- toYaml . | trim | nindent 2 -}}
@@ -35,6 +38,13 @@ imagePullSecrets:
 {{- end }}
 {{- with .Values.podSecurityContext }}
 securityContext:
+  {{- toYaml . | trim | nindent 2 }}
+{{- end }}
+{{- if and (eq (typeOf .Values.hostNetwork) "bool") .Values.hostNetwork }}
+hostNetwork: true
+{{- end }}
+{{- with .Values.topologySpreadConstraints }}
+topologySpreadConstraints:
   {{- toYaml . | trim | nindent 2 }}
 {{- end }}
 {{- with .Values.initContainers }}
@@ -86,13 +96,32 @@ containers:
       {{- toYaml . | trim | nindent 6 }}
     {{- end }}
     {{- include "dragonfly.volumemounts" . | trim | nindent 4 }}
-    {{- if .Values.passwordFromSecret.enable }}
+    {{- if or .Values.passwordFromSecret.enable .Values.env }}
     env:
+    {{- if .Values.passwordFromSecret.enable }}
+    {{- $appVersion := .Chart.AppVersion | trimPrefix "v" }}
+    {{- $imageTag := .Values.image.tag | trimPrefix "v" }}
+    {{- $effectiveVersion := $appVersion }}
+    {{- if and $imageTag (ne $imageTag "") }}
+      {{- $effectiveVersion = $imageTag }}
+    {{- end }}
+    {{- if semverCompare ">=1.14.0" $effectiveVersion }}
+      - name: DFLY_requirepass
+    {{- else }}
       - name: DFLY_PASSWORD
+    {{- end }}
         valueFrom:
           secretKeyRef:
-            name: {{ .Values.passwordFromSecret.existingSecret.name }}
+            name: {{ tpl .Values.passwordFromSecret.existingSecret.name $ }}
             key: {{ .Values.passwordFromSecret.existingSecret.key }}
+    {{- end }}
+    {{- with .Values.env }}
+      {{- toYaml . | trim | nindent 6 }}
+    {{- end }}
+    {{- end }}
+    {{- with .Values.envFrom }}
+    envFrom:
+      {{- toYaml . | trim | nindent 6 }}
     {{- end }}
 
 {{- if or (.Values.tls.enabled) (.Values.extraVolumes) }}

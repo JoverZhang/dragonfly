@@ -3,9 +3,11 @@
 
 #include "util.h"
 #include "rax.h"
-#include "object.h"
+#include "sds.h"
 #include "listpack.h"
 
+
+typedef struct redisObject robj;
 
 /* Stream item ID: a 128 bit number composed of a milliseconds time and
  * a sequence counter. IDs generated in the same millisecond (or in a past
@@ -77,7 +79,8 @@ typedef struct streamCG {
 
 /* A specific consumer in a consumer group.  */
 typedef struct streamConsumer {
-    mstime_t seen_time;         /* Last time this consumer was active. */
+    mstime_t seen_time;         /* Last time this consumer tried to perform an action (attempted reading/claiming). */
+    mstime_t active_time;       /* Last time this consumer was active (successful reading/claiming). */
     sds name;                   /* Consumer name. This is how the consumer
                                    will be identified in the consumer group
                                    protocol. Case sensitive. */
@@ -98,12 +101,6 @@ typedef struct streamNACK {
                                    in the last delivery. */
 } streamNACK;
 
-/* Stream propagation information, passed to functions in order to propagate
- * XCLAIM commands to AOF and slaves. */
-typedef struct streamPropInfo {
-    robj *keyname;
-    robj *groupname;
-} streamPropInfo;
 
 typedef struct {
   /* XADD options */
@@ -128,16 +125,13 @@ typedef struct {
 /* Prototypes of exported APIs. */
 // struct client;
 
-/* Flags for streamLookupConsumer */
-#define SLC_DEFAULT      0
-#define SLC_NO_REFRESH   (1<<0) /* Do not update consumer's seen-time */
-
 /* Flags for streamCreateConsumer */
 #define SCC_DEFAULT       0
 #define SCC_NO_NOTIFY     (1<<0) /* Do not notify key space if consumer created */
 #define SCC_NO_DIRTIFY    (1<<1) /* Do not dirty++ if consumer created */
 
 #define SCG_INVALID_ENTRIES_READ -1
+#define SCG_INVALID_LAG -1
 
 #define TRIM_STRATEGY_NONE 0
 #define TRIM_STRATEGY_MAXLEN 1
@@ -145,7 +139,6 @@ typedef struct {
 
 stream *streamNew(void);
 void freeStream(stream *s);
-unsigned long streamLength(const robj *subject);
 // size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end, size_t count, int rev, streamCG *group, streamConsumer *consumer, int flags, streamPropInfo *spi);
 void streamIteratorStart(streamIterator *si, stream *s, streamID *start, streamID *end, int rev);
 int streamIteratorGetID(streamIterator *si, streamID *id, int64_t *numfields);
@@ -153,17 +146,16 @@ void streamIteratorGetField(streamIterator *si, unsigned char **fieldptr, unsign
 void streamIteratorRemoveEntry(streamIterator *si, streamID *current);
 void streamIteratorStop(streamIterator *si);
 streamCG *streamLookupCG(stream *s, sds groupname);
-streamConsumer *streamLookupConsumer(streamCG *cg, sds name, int flags);
-streamConsumer *streamCreateConsumer(streamCG *cg, sds name, robj *key, int dbid, int flags);
+streamConsumer *streamLookupConsumer(streamCG *cg, sds name);
 streamCG *streamCreateCG(stream *s, const char *name, size_t namelen, streamID *id, long long entries_read);
-streamNACK *streamCreateNACK(streamConsumer *consumer);
+void streamEncodeID(void *buf, streamID *id);
 void streamDecodeID(void *buf, streamID *id);
 int streamCompareID(streamID *a, streamID *b);
+int streamEntryExists(stream *s, streamID *id);
 void streamFreeNACK(streamNACK *na);
 int streamIncrID(streamID *id);
 int streamDecrID(streamID *id);
-// void streamPropagateConsumerCreation(client *c, robj *key, robj *groupname, sds consumername);
-robj *streamDup(robj *o);
+
 int streamValidateListpackIntegrity(unsigned char *lp, size_t size, int deep);
 int streamParseID(const robj *o, streamID *id);
 robj *createObjectFromStreamID(streamID *id);
@@ -178,5 +170,7 @@ void streamFreeCG(streamCG *cg);
 void streamDelConsumer(streamCG *cg, streamConsumer *consumer);
 void streamLastValidID(stream *s, streamID *maxid);
 int streamIDEqZero(streamID *id);
+int streamRangeHasTombstones(stream *s, streamID *start, streamID *end);
+long long streamCGLag(stream *s, streamCG *cg);
 
 #endif

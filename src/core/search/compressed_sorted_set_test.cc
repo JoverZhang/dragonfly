@@ -4,14 +4,46 @@
 
 #include "core/search/compressed_sorted_set.h"
 
+#include <absl/container/btree_set.h>
+
 #include <algorithm>
 
 #include "base/gtest.h"
 #include "base/logging.h"
+#include "core/bptree_set.h"
 
 namespace dfly::search {
 
 using namespace std;
+
+namespace {
+
+struct SetInserter {
+  using iterator_category = std::forward_iterator_tag;
+  using difference_type = std::ptrdiff_t;
+  using value_type = CompressedSortedSet::IntType;
+  using pointer = value_type*;
+  using reference = value_type&;
+
+  explicit SetInserter(CompressedSortedSet* set) : set_{set} {};
+
+  SetInserter& operator*() {
+    return *this;
+  }
+  SetInserter& operator++() {
+    return *this;
+  }
+
+  SetInserter& operator=(value_type value) {
+    set_->Insert(value);
+    return *this;
+  }
+
+ private:
+  CompressedSortedSet* set_;
+};
+
+}  // namespace
 
 class CompressedSortedSetTest : public ::testing::Test {
  protected:
@@ -20,7 +52,7 @@ class CompressedSortedSetTest : public ::testing::Test {
 using IdVec = vector<uint32_t>;
 
 TEST_F(CompressedSortedSetTest, BasicInsert) {
-  CompressedSortedSet list;
+  CompressedSortedSet list{PMR_NS::get_default_resource()};
   IdVec list_copy;
 
   auto current = [&list]() { return IdVec{list.begin(), list.end()}; };
@@ -77,7 +109,7 @@ TEST_F(CompressedSortedSetTest, BasicInsert) {
 }
 
 TEST_F(CompressedSortedSetTest, BasicInsertLargeValues) {
-  CompressedSortedSet list;
+  CompressedSortedSet list{PMR_NS::get_default_resource()};
   IdVec list_copy;
 
   const uint32_t kBase = 1'000'000'000;
@@ -108,21 +140,21 @@ TEST_F(CompressedSortedSetTest, BasicInsertLargeValues) {
 }
 
 TEST_F(CompressedSortedSetTest, SortedBackInserter) {
-  CompressedSortedSet list;
+  CompressedSortedSet list{PMR_NS::get_default_resource()};
 
   vector<uint32_t> v1 = {1, 3, 5};
   vector<uint32_t> v2 = {2, 4, 6};
 
-  merge(v1.begin(), v1.end(), v2.begin(), v2.end(), CompressedSortedSet::SortedBackInserter{&list});
+  merge(v1.begin(), v1.end(), v2.begin(), v2.end(), SetInserter{&list});
 
   EXPECT_EQ(IdVec(list.begin(), list.end()), IdVec({1, 2, 3, 4, 5, 6}));
 }
 
 TEST_F(CompressedSortedSetTest, BasicRemove) {
-  CompressedSortedSet list;
+  CompressedSortedSet list{PMR_NS::get_default_resource()};
 
   IdVec values = {1, 3, 4, 7, 8, 11, 15, 17, 20, 22, 27};
-  copy(values.begin(), values.end(), CompressedSortedSet::SortedBackInserter(&list));
+  copy(values.begin(), values.end(), SetInserter{&list});
   EXPECT_EQ(IdVec(list.begin(), list.end()), values);
 
   auto remove = [&list, &values](uint32_t value) {
@@ -150,10 +182,10 @@ TEST_F(CompressedSortedSetTest, BasicRemove) {
 }
 
 TEST_F(CompressedSortedSetTest, BasicRemoveLargeValues) {
-  CompressedSortedSet list;
+  CompressedSortedSet list{PMR_NS::get_default_resource()};
 
   IdVec values = {1, 12, 123, 123'4, 123'45, 123'456, 1'234'567, 12'345'678};
-  copy(values.begin(), values.end(), CompressedSortedSet::SortedBackInserter(&list));
+  copy(values.begin(), values.end(), SetInserter{&list});
   EXPECT_EQ(IdVec(list.begin(), list.end()), values);
 
   auto remove = [&list, &values](uint32_t value) {
@@ -179,7 +211,7 @@ TEST_F(CompressedSortedSetTest, BasicRemoveLargeValues) {
 }
 
 TEST_F(CompressedSortedSetTest, InsertRemoveLargeValues) {
-  CompressedSortedSet list;
+  CompressedSortedSet list{PMR_NS::get_default_resource()};
 
   for (int shift = 3; shift < 30; shift++) {
     uint32_t value = 1u << shift;

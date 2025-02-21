@@ -27,7 +27,7 @@ inline bool MayHaveTtl(sds s) {
 
 sds AllocImmutableWithTtl(uint32_t len, uint32_t at) {
   sds res = AllocSdsWithSpace(len, sizeof(at));
-  absl::little_endian::Store32(res + len + 1, at);
+  absl::little_endian::Store32(res + len + 1, at);  // Save TTL
 
   return res;
 }
@@ -38,46 +38,42 @@ StringSet::~StringSet() {
   Clear();
 }
 
-bool StringSet::AddSds(sds s1) {
-  return AddOrFindObj(s1, false) == nullptr;
-}
-
 bool StringSet::Add(string_view src, uint32_t ttl_sec) {
-  DCHECK_GT(ttl_sec, 0u);  // ttl_sec == 0 would mean find and delete immediately
-
-  sds newsds = nullptr;
-  bool has_ttl = false;
-
-  if (ttl_sec == UINT32_MAX) {
-    newsds = sdsnewlen(src.data(), src.size());
-  } else {
-    uint32_t at = time_now() + ttl_sec;
-    DCHECK_LT(time_now(), at);
-
-    newsds = AllocImmutableWithTtl(src.size(), at);
-    if (!src.empty())
-      memcpy(newsds, src.data(), src.size());
-    has_ttl = true;
-  }
-
-  if (AddOrFindObj(newsds, has_ttl) != nullptr) {
-    sdsfree(newsds);
+  uint64_t hash = Hash(&src, 1);
+  void* prev = FindInternal(&src, hash, 1);
+  if (prev != nullptr) {
     return false;
   }
 
+  sds newsds = MakeSetSds(src, ttl_sec);
+  bool has_ttl = ttl_sec != UINT32_MAX;
+  AddUnique(newsds, has_ttl, hash);
   return true;
 }
 
-bool StringSet::Erase(string_view str) {
-  return EraseInternal(&str, 1);
-}
+unsigned StringSet::AddBatch(absl::Span<std::string_view> span, uint32_t ttl_sec) {
+  uint64_t hash[kMaxBatchLen];
+  bool has_ttl = ttl_sec != UINT32_MAX;
+  unsigned count = span.size();
+  unsigned res = 0;
 
-bool StringSet::Contains(string_view s1) const {
-  return FindInternal(&s1, 1) != nullptr;
-}
+  DCHECK_LE(count, kMaxBatchLen);
 
-void StringSet::Clear() {
-  ClearInternal();
+  for (size_t i = 0; i < count; i++) {
+    hash[i] = CompactObj::HashCode(span[i]);
+    Prefetch(hash[i]);
+  }
+
+  for (unsigned i = 0; i < count; ++i) {
+    void* prev = FindInternal(&span[i], hash[i], 1);
+    if (prev == nullptr) {
+      ++res;
+      sds field = MakeSetSds(span[i], ttl_sec);
+      AddUnique(field, has_ttl, hash[i]);
+    }
+  }
+
+  return res;
 }
 
 std::optional<std::string> StringSet::Pop() {
@@ -141,8 +137,72 @@ uint32_t StringSet::ObjExpireTime(const void* str) const {
   return absl::little_endian::Load32(ttlptr);
 }
 
+void StringSet::ObjUpdateExpireTime(const void* obj, uint32_t ttl_sec) {
+  return SdsUpdateExpireTime(obj, time_now() + ttl_sec, 0);
+}
+
 void StringSet::ObjDelete(void* obj, bool has_ttl) const {
   sdsfree((sds)obj);
+}
+
+void* StringSet::ObjectClone(const void* obj, bool has_ttl, bool add_ttl) const {
+  sds src = (sds)obj;
+  string_view sv{src, sdslen(src)};
+  uint32_t ttl_sec = add_ttl ? 0 : (has_ttl ? ObjExpireTime(obj) : UINT32_MAX);
+  return (void*)MakeSetSds(sv, ttl_sec);
+}
+
+sds StringSet::MakeSetSds(string_view src, uint32_t ttl_sec) const {
+  if (ttl_sec != UINT32_MAX) {
+    uint32_t at = time_now() + ttl_sec;
+
+    sds newsds = AllocImmutableWithTtl(src.size(), at);
+    if (!src.empty())
+      memcpy(newsds, src.data(), src.size());
+    return newsds;
+  }
+
+  return sdsnewlen(src.data(), src.size());
+}
+
+// Does not release obj. Callers must deallocate with sdsfree explicitly
+pair<sds, bool> StringSet::DuplicateEntryIfFragmented(void* obj, float ratio) {
+  sds key = (sds)obj;
+
+  if (!zmalloc_page_is_underutilized(key, ratio))
+    return {key, false};
+
+  size_t key_len = sdslen(key);
+  bool has_ttl = MayHaveTtl(key);
+
+  if (has_ttl) {
+    sds res = AllocSdsWithSpace(key_len, sizeof(uint32_t));
+    std::memcpy(res, key, key_len + sizeof(uint32_t));
+    return {res, true};
+  }
+
+  return {sdsnewlen(key, key_len), true};
+}
+
+bool StringSet::iterator::ReallocIfNeeded(float ratio) {
+  auto* ptr = curr_entry_;
+  if (ptr->IsLink()) {
+    ptr = ptr->AsLink();
+  }
+
+  DCHECK(!ptr->IsEmpty());
+  DCHECK(ptr->IsObject());
+
+  auto* obj = ptr->GetObject();
+  auto [new_obj, realloced] =
+      static_cast<StringSet*>(owner_)->DuplicateEntryIfFragmented(obj, ratio);
+
+  if (realloced) {
+    ptr->SetObject(new_obj);
+    sdsfree((sds)obj);
+  }
+
+  return realloced;
 }
 
 }  // namespace dfly

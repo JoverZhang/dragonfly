@@ -4,10 +4,14 @@
 
 #pragma once
 
-#include "server/cluster/cluster_config.h"
+#include "server/cluster/cluster_defs.h"
 #include "server/conn_context.h"
 
 namespace dfly {
+
+namespace cluster {
+class ClusterFamily;
+}
 
 class EngineShardSet;
 class ServerFamily;
@@ -17,29 +21,43 @@ class DebugCmd {
   struct PopulateOptions {
     uint64_t total_count = 0;
     std::string_view prefix{"key"};
-    uint32_t val_size = 0;
+    uint32_t val_size = 16;
     bool populate_random_values = false;
+    std::string type{"STRING"};
+    uint32_t elements = 1;
 
-    std::optional<ClusterConfig::SlotRange> slot_range;
+    std::optional<cluster::SlotRange> slot_range;
   };
 
  public:
-  DebugCmd(ServerFamily* owner, ConnectionContext* cntx);
+  DebugCmd(ServerFamily* owner, cluster::ClusterFamily* cf, ConnectionContext* cntx);
 
-  void Run(CmdArgList args);
+  void Run(CmdArgList args, facade::SinkReplyBuilder* builder);
+
+  static void Shutdown();
 
  private:
-  void Populate(CmdArgList args);
-  std::optional<PopulateOptions> ParsePopulateArgs(CmdArgList args);
+  void Populate(CmdArgList args, facade::SinkReplyBuilder* builder);
+  static std::optional<PopulateOptions> ParsePopulateArgs(CmdArgList args,
+                                                          facade::SinkReplyBuilder* builder);
   void PopulateRangeFiber(uint64_t from, uint64_t count, const PopulateOptions& opts);
-  void Reload(CmdArgList args);
-  void Replica(CmdArgList args);
-  void Load(std::string_view filename);
-  void Inspect(std::string_view key);
-  void Watched();
-  void TxAnalysis();
+
+  void Reload(CmdArgList args, facade::SinkReplyBuilder* builder);
+  void Replica(CmdArgList args, facade::SinkReplyBuilder* builder);
+  void Migration(CmdArgList args, facade::SinkReplyBuilder* builder);
+
+  void Exec(facade::SinkReplyBuilder* builder);
+  void Inspect(std::string_view key, CmdArgList args, facade::SinkReplyBuilder* builder);
+  void Watched(facade::SinkReplyBuilder* builder);
+  void TxAnalysis(facade::SinkReplyBuilder* builder);
+  void ObjHist(facade::SinkReplyBuilder* builder);
+  void Stacktrace(facade::SinkReplyBuilder* builder);
+  void Shards(facade::SinkReplyBuilder* builder);
+  void LogTraffic(CmdArgList, facade::SinkReplyBuilder* builder);
+  void RecvSize(std::string_view param, facade::SinkReplyBuilder* builder);
 
   ServerFamily& sf_;
+  cluster::ClusterFamily& cf_;
   ConnectionContext* cntx_;
 };
 

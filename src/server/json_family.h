@@ -5,42 +5,46 @@
 #pragma once
 
 #include "server/common.h"
-#include "server/engine_shard_set.h"
+
+namespace facade {
+class SinkReplyBuilder;
+}  // namespace facade
 
 namespace dfly {
 
-class ConnectionContext;
 class CommandRegistry;
-using facade::OpResult;
-using facade::OpStatus;
-using facade::RedisReplyBuilder;
+struct CommandContext;
 
 class JsonFamily {
  public:
   static void Register(CommandRegistry* registry);
 
  private:
-  static void Get(CmdArgList args, ConnectionContext* cntx);
-  static void MGet(CmdArgList args, ConnectionContext* cntx);
-  static void Type(CmdArgList args, ConnectionContext* cntx);
-  static void StrLen(CmdArgList args, ConnectionContext* cntx);
-  static void ObjLen(CmdArgList args, ConnectionContext* cntx);
-  static void ArrLen(CmdArgList args, ConnectionContext* cntx);
-  static void Toggle(CmdArgList args, ConnectionContext* cntx);
-  static void NumIncrBy(CmdArgList args, ConnectionContext* cntx);
-  static void NumMultBy(CmdArgList args, ConnectionContext* cntx);
-  static void Del(CmdArgList args, ConnectionContext* cntx);
-  static void ObjKeys(CmdArgList args, ConnectionContext* cntx);
-  static void StrAppend(CmdArgList args, ConnectionContext* cntx);
-  static void Clear(CmdArgList args, ConnectionContext* cntx);
-  static void ArrPop(CmdArgList args, ConnectionContext* cntx);
-  static void ArrTrim(CmdArgList args, ConnectionContext* cntx);
-  static void ArrInsert(CmdArgList args, ConnectionContext* cntx);
-  static void ArrAppend(CmdArgList args, ConnectionContext* cntx);
-  static void ArrIndex(CmdArgList args, ConnectionContext* cntx);
-  static void Debug(CmdArgList args, ConnectionContext* cntx);
-  static void Resp(CmdArgList args, ConnectionContext* cntx);
-  static void Set(CmdArgList args, ConnectionContext* cntx);
+  using SinkReplyBuilder = facade::SinkReplyBuilder;
+
+  static void Get(CmdArgList args, const CommandContext& cmd_cntx);
+  static void MGet(CmdArgList args, const CommandContext& cmd_cntx);
+  static void Type(CmdArgList args, const CommandContext& cmd_cntx);
+  static void StrLen(CmdArgList args, const CommandContext& cmd_cntx);
+  static void ObjLen(CmdArgList args, const CommandContext& cmd_cntx);
+  static void ArrLen(CmdArgList args, const CommandContext& cmd_cntx);
+  static void Toggle(CmdArgList args, const CommandContext& cmd_cntx);
+  static void NumIncrBy(CmdArgList args, const CommandContext& cmd_cntx);
+  static void NumMultBy(CmdArgList args, const CommandContext& cmd_cntx);
+  static void Del(CmdArgList args, const CommandContext& cmd_cntx);
+  static void ObjKeys(CmdArgList args, const CommandContext& cmd_cntx);
+  static void StrAppend(CmdArgList args, const CommandContext& cmd_cntx);
+  static void Clear(CmdArgList args, const CommandContext& cmd_cntx);
+  static void ArrPop(CmdArgList args, const CommandContext& cmd_cntx);
+  static void ArrTrim(CmdArgList args, const CommandContext& cmd_cntx);
+  static void ArrInsert(CmdArgList args, const CommandContext& cmd_cntx);
+  static void ArrAppend(CmdArgList args, const CommandContext& cmd_cntx);
+  static void ArrIndex(CmdArgList args, const CommandContext& cmd_cntx);
+  static void Debug(CmdArgList args, const CommandContext& cmd_cntx);
+  static void Resp(CmdArgList args, const CommandContext& cmd_cntx);
+  static void Set(CmdArgList args, const CommandContext& cmd_cntx);
+  static void MSet(CmdArgList args, const CommandContext& cmd_cntx);
+  static void Merge(CmdArgList args, const CommandContext& cmd_cntx);
 };
 
 }  // namespace dfly

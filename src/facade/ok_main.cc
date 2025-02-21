@@ -4,6 +4,7 @@
 
 #include "base/init.h"
 #include "facade/conn_context.h"
+#include "facade/dragonfly_connection.h"
 #include "facade/dragonfly_listener.h"
 #include "facade/service_interface.h"
 #include "util/accept_server.h"
@@ -19,30 +20,36 @@ namespace facade {
 
 namespace {
 
-thread_local ConnectionStats tl_stats;
-
 class OkService : public ServiceInterface {
  public:
-  void DispatchCommand(CmdArgList args, ConnectionContext* cntx) final {
-    (*cntx)->SendOk();
+  void DispatchCommand(ArgSlice args, SinkReplyBuilder* builder, ConnectionContext* cntx) final {
+    builder->SendOk();
+  }
+
+  size_t DispatchManyCommands(absl::Span<ArgSlice> args_lists, SinkReplyBuilder* builder,
+                              ConnectionContext* cntx) final {
+    for (auto args : args_lists)
+      DispatchCommand(args, builder, cntx);
+    return args_lists.size();
   }
 
   void DispatchMC(const MemcacheParser::Command& cmd, std::string_view value,
-                  ConnectionContext* cntx) final {
-    cntx->reply_builder()->SendError("");
+                  MCReplyBuilder* builder, ConnectionContext* cntx) final {
+    builder->SendError("");
   }
 
-  ConnectionContext* CreateContext(util::FiberSocketBase* peer, Connection* owner) final {
-    return new ConnectionContext{peer, owner};
-  }
-
-  ConnectionStats* GetThreadLocalConnectionStats() final {
-    return &tl_stats;
+  ConnectionContext* CreateContext(Connection* owner) final {
+    return new ConnectionContext{owner};
   }
 };
 
 void RunEngine(ProactorPool* pool, AcceptServer* acceptor) {
   OkService service;
+
+  Connection::Init(pool->size());
+  pool->Await([](auto*) {
+    tl_facade_stats = new FacadeStats;
+  });
 
   acceptor->AddListener(GetFlag(FLAGS_port), new Listener{Protocol::REDIS, &service});
 
@@ -54,12 +61,22 @@ void RunEngine(ProactorPool* pool, AcceptServer* acceptor) {
 
 }  // namespace facade
 
+#ifdef __linux__
+#define USE_URING 1
+#else
+#define USE_URING 0
+#endif
+
 int main(int argc, char* argv[]) {
   MainInitGuard guard(&argc, &argv);
 
   CHECK_GT(GetFlag(FLAGS_port), 0u);
 
+#if USE_URING
   unique_ptr<util::ProactorPool> pp(fb2::Pool::IOUring(1024));
+#else
+  unique_ptr<util::ProactorPool> pp(fb2::Pool::Epoll());
+#endif
   pp->Run();
 
   AcceptServer acceptor(pp.get());
